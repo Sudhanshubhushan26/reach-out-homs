@@ -652,8 +652,8 @@ export default function App() {
         {/* Logo */}
         <div style={{ padding:"18px 14px 14px", borderBottom:"1px solid rgba(139,92,246,0.2)", display:"flex", alignItems:"center", gap:10, minHeight:70 }}>
           <div style={{ flexShrink:0, position:"relative" }}>
-            <img src="/logo.svg" alt="logo" style={{ width:38, height:38, borderRadius:"50%", objectFit:"cover", border:"2px solid rgba(139,92,246,0.5)" }}
-              onError={e=>{ e.target.style.display="none"; e.target.nextSibling.style.display="flex"; }}/>
+            <img src="/logo.png" alt="logo" style={{ width:38, height:38, borderRadius:"50%", objectFit:"cover", border:"2px solid rgba(139,92,246,0.5)" }}
+              onError={e=>{ if(!e.target.dataset.tried){e.target.dataset.tried="1";e.target.src="/logo.svg";} else {e.target.style.display="none"; e.target.nextSibling.style.display="flex";} }}/>
             <div style={{ width:38, height:38, borderRadius:"50%", background:G.purple, display:"none", alignItems:"center", justifyContent:"center", fontSize:18 }}>🏥</div>
             <div style={{ position:"absolute", bottom:0, right:0, width:11, height:11, background:"#10B981", borderRadius:"50%", border:"2px solid #1E1B4B" }}/>
           </div>
@@ -884,8 +884,8 @@ function LoginPage({ setToken, setUser }) {
       }}>
         <div style={{ textAlign:"center", marginBottom:32 }}>
           <div style={{ position:"relative", display:"inline-block", marginBottom:16 }}>
-            <img src="/logo.svg" alt="logo" style={{ width:88, height:88, borderRadius:"50%", objectFit:"cover", border:"3px solid #EDE9FE", boxShadow:"0 8px 24px rgba(124,58,237,0.2)" }}
-              onError={e=>{ e.target.style.display="none"; e.target.nextSibling.style.display="flex"; }}/>
+            <img src="/logo.png" alt="logo" style={{ width:88, height:88, borderRadius:"50%", objectFit:"cover", border:"3px solid #EDE9FE", boxShadow:"0 8px 24px rgba(124,58,237,0.2)" }}
+              onError={e=>{ if(!e.target.dataset.tried){e.target.dataset.tried="1";e.target.src="/logo.svg";} else {e.target.style.display="none"; e.target.nextSibling.style.display="flex";} }}/>
             <div style={{ width:88, height:88, borderRadius:"50%", background:G.purple, display:"none", alignItems:"center", justifyContent:"center", fontSize:40 }}>🏥</div>
             <div className="glow-badge" style={{ position:"absolute", bottom:2, right:2, width:22, height:22, background:C.green, borderRadius:"50%", border:"3px solid white", display:"flex", alignItems:"center", justifyContent:"center", fontSize:10, color:"#fff", fontWeight:900 }}>✓</div>
           </div>
