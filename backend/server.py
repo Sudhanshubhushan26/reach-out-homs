@@ -67,15 +67,109 @@ async def current_user(authorization: Optional[str] = Header(None)):
     except jwt.PyJWTError:
         raise HTTPException(401, "Invalid token")
 
+# ── RBAC ───────────────────────────────────────────────────────────────────
+ROLES = ["admin", "manager", "supervisor", "accountant", "foe", "staff"]
+PERMS = {
+    "admin": {"*"},
+    "manager": {"staff:read","staff:write","patient:read","patient:write","booking:*","payroll:read","payroll:write","report:*","analytics:*","compliance:*","refund:verify","refund:approve","roster:*","incident:*"},
+    "supervisor": {"staff:read","patient:read","booking:read","roster:read","roster:write","attendance:read","incident:read","incident:write","report:read"},
+    "accountant": {"bill:*","refund:verify","payroll:read","report:read","analytics:read"},
+    "foe": {"lead:*","patient:read","patient:write","booking:read","booking:write","refund:initiate"},
+    "staff":  {"self:*","attendance:write","chart:*","incident:write"},
+}
+def has_perm(user_role: str, perm: str) -> bool:
+    p = PERMS.get(user_role, set())
+    if "*" in p: return True
+    if perm in p: return True
+    head = perm.split(":")[0] + ":*"
+    return head in p
+
+def require(perm: str):
+    async def dep(user=Depends(current_user)):
+        if not has_perm(user.get("role",""), perm):
+            raise HTTPException(403, f"Forbidden: requires {perm}")
+        return user
+    return dep
+
+# ── Audit log ──────────────────────────────────────────────────────────────
+async def audit(user, action: str, target_type: str, target_id=None, before=None, after=None, notes: str = ""):
+    try:
+        await db.audit_logs.insert_one({
+            "id": await next_id("audit_logs"),
+            "user_id": user.get("id"), "user_name": user.get("name"), "user_role": user.get("role"),
+            "action": action, "target_type": target_type, "target_id": target_id,
+            "before": before, "after": after, "notes": notes,
+            "created_at": now_iso(),
+        })
+    except Exception as e:
+        logger.warning(f"audit failed: {e}")
+
+# ── Weighted rating ────────────────────────────────────────────────────────
+RATING_WEIGHTS = {
+    "patient_feedback": 0.40,
+    "family_feedback": 0.20,
+    "punctuality": 0.15,
+    "tat": 0.10,
+    "training": 0.10,
+    "supervisor": 0.05,
+}
+async def recalc_weighted_rating(staff_id: int):
+    """Compute weighted rating using source weights; fall back to avg if no sources tagged."""
+    pipe = [
+        {"$match": {"staff_id": staff_id}},
+        {"$group": {"_id": "$source", "avg": {"$avg": "$score"}, "count": {"$sum": 1}}},
+    ]
+    rows = await db.staff_ratings.aggregate(pipe).to_list(50)
+    if not rows: return
+    src_map = {r["_id"] or "patient_feedback": r["avg"] for r in rows}
+    # Normalise source labels
+    alias = {
+        "Patient Feedback": "patient_feedback", "Patient": "patient_feedback",
+        "Family": "family_feedback", "Family Feedback": "family_feedback",
+        "Punctuality": "punctuality",
+        "TAT": "tat", "Duty Completion TAT": "tat",
+        "Training": "training", "Training Score": "training",
+        "Supervisor": "supervisor", "Supervisor Feedback": "supervisor",
+    }
+    bucket = {k: 0.0 for k in RATING_WEIGHTS}
+    bucket_w = {k: 0.0 for k in RATING_WEIGHTS}
+    fallback_avg, fallback_n = 0.0, 0
+    for label, avg in src_map.items():
+        key = alias.get(label, label if label in RATING_WEIGHTS else "patient_feedback")
+        bucket[key] += avg; bucket_w[key] += 1
+        fallback_avg += avg; fallback_n += 1
+    used_w = 0.0; rating = 0.0
+    for k, w in RATING_WEIGHTS.items():
+        if bucket_w[k] > 0:
+            rating += (bucket[k] / bucket_w[k]) * w
+            used_w += w
+    final = rating / used_w if used_w > 0 else (fallback_avg / fallback_n if fallback_n else 0)
+    await db.staff.update_one({"id": staff_id}, {"$set": {"rating": round(final, 2)}})
+    return round(final, 2)
+
 # ── Seed ───────────────────────────────────────────────────────────────────
 async def seed():
     if not await db.users.find_one({"username": "admin"}):
         await db.users.insert_one({
             "id": await next_id("users"), "username": "admin",
             "password": pwd_ctx.hash("Admin@1234"),
-            "role": "admin", "name": "Super Admin",
+            "role": "admin", "name": "Super Admin", "status": "Active",
             "created_at": now_iso(),
         })
+    # Seed extra role users
+    extra_users = [
+        ("manager", "Manager@1234", "manager", "Operations Manager"),
+        ("supervisor", "Super@1234", "supervisor", "Field Supervisor"),
+        ("accountant", "Account@1234", "accountant", "Finance Accountant"),
+        ("foe", "Foe@1234", "foe", "Front Office Executive"),
+    ]
+    for uname, pwd, role, name in extra_users:
+        if not await db.users.find_one({"username": uname}):
+            await db.users.insert_one({
+                "id": await next_id("users"), "username": uname,
+                "password": pwd_ctx.hash(pwd), "role": role, "name": name,
+                "status": "Active", "created_at": now_iso(),
+            })
     if not await db.staff.find_one({"code": "RO001"}):
         staff_seed = [
             ("RO001","Prachi Sharma","Nurse","Nursing","MedCare Staffing","On Duty",4.8,"9876541001","Rohini, Delhi","B.Sc Nursing","6 years","Permanent","25000"),
@@ -381,9 +475,9 @@ async def add_rating(sid: int, body: Dict[str, Any], user=Depends(current_user))
     await db.staff_ratings.insert_one({"id": await next_id("staff_ratings"), "staff_id": sid,
         "patient_id": body.get("patient_id"), "source": body.get("source"),
         "score": body.get("score"), "comment": body.get("comment"), "rated_at": now_iso()})
-    a = await db.staff_ratings.aggregate([{"$match":{"staff_id":sid}},{"$group":{"_id":None,"v":{"$avg":"$score"}}}]).to_list(1)
-    if a: await db.staff.update_one({"id": sid}, {"$set": {"rating": round(a[0]["v"], 2)}})
-    return {"message": "Rating submitted"}
+    new_rating = await recalc_weighted_rating(sid)
+    await audit(user, "create", "staff_rating", sid, after={"score": body.get("score"), "source": body.get("source")})
+    return {"message": "Rating submitted", "weighted_rating": new_rating}
 
 @api.get("/staff/{sid}/ratings")
 async def get_ratings(sid: int, user=Depends(current_user)):
@@ -614,23 +708,53 @@ async def list_refunds(status: Optional[str]=None, user=Depends(current_user)):
 
 @api.post("/refunds")
 async def add_refund(d: Dict[str, Any], user=Depends(current_user)):
+    if not has_perm(user.get("role",""), "refund:initiate"):
+        raise HTTPException(403, "Forbidden")
     rid = await next_id("refunds")
-    await db.refunds.insert_one({"id": rid, "status": "Pending", "mode": d.get("mode","NEFT"),
+    # Identity & bank capture per requirement
+    bank = d.get("bank_account","")
+    masked = (("X" * max(0, len(bank)-4)) + bank[-4:]) if bank else ""
+    doc = {
+        "id": rid, "status": "Pending", "mode": d.get("mode","NEFT"),
         "initiator": user.get("name","Admin"), "initiated_at": now_iso(),
-        **{k:v for k,v in d.items() if k not in ("id","status","initiator","initiated_at")}})
+        "receipt_id": d.get("receipt_id"), "booking_id": d.get("booking_id"),
+        "patient_id": d.get("patient_id"), "amount": d.get("amount"),
+        "reason": d.get("reason",""), "reason_category": d.get("reason_category",""),
+        "relative_name": d.get("relative_name",""), "relation": d.get("relation",""),
+        "govt_id_type": d.get("govt_id_type",""), "govt_id_number": d.get("govt_id_number",""),
+        "id_proof_path": d.get("id_proof_path",""), "cancelled_cheque_path": d.get("cancelled_cheque_path",""),
+        "bank_account_full": bank, "bank_account": masked,
+        "ifsc": d.get("ifsc",""), "account_holder": d.get("account_holder",""),
+        "upi_id": d.get("upi_id",""), "contact": d.get("contact",""),
+    }
+    await db.refunds.insert_one(doc)
+    await audit(user, "create", "refund", rid, after={"amount": d.get("amount"), "patient_id": d.get("patient_id")})
     return {"id": rid, "message": "Refund initiated"}
+
+@api.post("/refunds/{rid}/upload-doc")
+async def upload_refund_doc(rid: int, document: UploadFile = File(...), doc_type: str = Form("id_proof"), user=Depends(current_user)):
+    path = UPLOAD_DIR / "patients" / f"refund-{doc_type}-{rid}-{int(datetime.now().timestamp()*1000)}-{document.filename}"
+    path.write_bytes(await document.read())
+    field = "id_proof_path" if doc_type == "id_proof" else "cancelled_cheque_path"
+    await db.refunds.update_one({"id": rid}, {"$set": {field: str(path.relative_to(ROOT_DIR))}})
+    await audit(user, "upload", "refund", rid, after={"doc_type": doc_type})
+    return {"message": "Refund document uploaded"}
 
 @api.patch("/refunds/{rid}/approve")
 async def approve_refund(rid: int, body: Dict[str, Any], user=Depends(current_user)):
-    level = body.get("level"); name = user.get("name","Admin")
+    level = body.get("level"); name = user.get("name","Admin"); role = user.get("role","")
     if level == "verify":
-        await db.refunds.update_one({"id": rid}, {"$set": {"verifier": name, "status": "Verified"}})
+        if not has_perm(role, "refund:verify"): raise HTTPException(403, "Forbidden")
+        await db.refunds.update_one({"id": rid}, {"$set": {"verifier": name, "verified_at": now_iso(), "status": "Verified"}})
+        await audit(user, "verify", "refund", rid)
     else:
+        if not has_perm(role, "refund:approve"): raise HTTPException(403, "Forbidden")
         await db.refunds.update_one({"id": rid}, {"$set": {"approver": name, "status": "Approved",
             "approved_at": now_iso(), "utr": body.get("utr")}})
         r = await db.refunds.find_one({"id": rid})
         if r and r.get("receipt_id"):
             await db.bills.update_one({"id": r["receipt_id"]}, {"$set": {"watermark": "REFUND", "refund_status": "Processed"}})
+        await audit(user, "approve", "refund", rid, after={"utr": body.get("utr")})
     return {"message": f"Refund {'verified' if level=='verify' else 'approved'}"}
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1022,8 +1146,7 @@ async def add_feedback(d: Dict[str, Any], user=Depends(current_user)):
             "staff_id": d["staff_id"], "patient_id": d.get("patient_id"),
             "source":"Patient Feedback", "score": d["staff_rating"],
             "comment": d.get("comments",""), "rated_at": now_iso()})
-        a = await db.staff_ratings.aggregate([{"$match":{"staff_id":d["staff_id"]}},{"$group":{"_id":None,"v":{"$avg":"$score"}}}]).to_list(1)
-        if a: await db.staff.update_one({"id":d["staff_id"]}, {"$set":{"rating": round(a[0]["v"], 2)}})
+        await recalc_weighted_rating(d["staff_id"])
     return {"id": fid, "message": "Feedback submitted"}
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1217,6 +1340,256 @@ async def doc_expiry(user=Depends(current_user)):
         s = smap.get(d.get("staff_id"), {})
         d["staff_name"] = s.get("name"); d["staff_code"] = s.get("code")
     return docs
+
+# ────────────────────────────────────────────────────────────────────────────
+# USERS / RBAC
+# ────────────────────────────────────────────────────────────────────────────
+@api.get("/users")
+async def list_users(user=Depends(require("admin:read"))):
+    rows = await db.users.find({}, {"_id":0, "password":0}).sort("id", 1).to_list(500)
+    return rows
+
+@api.post("/users")
+async def create_user(d: Dict[str, Any], user=Depends(current_user)):
+    if user.get("role") != "admin": raise HTTPException(403, "Admin only")
+    if d.get("role") not in ROLES: raise HTTPException(400, f"Role must be one of {ROLES}")
+    if await db.users.find_one({"username": d.get("username")}):
+        raise HTTPException(400, "Username already exists")
+    uid = await next_id("users")
+    doc = {"id": uid, "username": d["username"], "name": d.get("name", d["username"]),
+           "role": d["role"], "password": pwd_ctx.hash(d.get("password", "Change@1234")),
+           "status": "Active", "phone": d.get("phone",""), "email": d.get("email",""),
+           "created_at": now_iso()}
+    await db.users.insert_one(doc)
+    await audit(user, "create", "user", uid, after={"username": d["username"], "role": d["role"]})
+    return {"id": uid, "message": "User created"}
+
+@api.put("/users/{uid}")
+async def update_user(uid: int, d: Dict[str, Any], user=Depends(current_user)):
+    if user.get("role") != "admin": raise HTTPException(403, "Admin only")
+    update = {k: v for k, v in d.items() if k in ("name", "role", "phone", "email", "status")}
+    if d.get("password"): update["password"] = pwd_ctx.hash(d["password"])
+    if update.get("role") and update["role"] not in ROLES:
+        raise HTTPException(400, f"Role must be one of {ROLES}")
+    before = await db.users.find_one({"id": uid}, {"_id":0, "password":0})
+    await db.users.update_one({"id": uid}, {"$set": update})
+    await audit(user, "update", "user", uid, before=before, after=update)
+    return {"message": "User updated"}
+
+@api.delete("/users/{uid}")
+async def delete_user(uid: int, user=Depends(current_user)):
+    if user.get("role") != "admin": raise HTTPException(403, "Admin only")
+    if uid == user.get("id"): raise HTTPException(400, "Cannot delete yourself")
+    await db.users.update_one({"id": uid}, {"$set": {"status": "Disabled"}})
+    await audit(user, "disable", "user", uid)
+    return {"message": "User disabled"}
+
+@api.get("/me")
+async def me(user=Depends(current_user)):
+    full = await db.users.find_one({"id": user.get("id")}, {"_id":0, "password":0})
+    return full or user
+
+@api.get("/roles")
+async def list_roles(user=Depends(current_user)):
+    return [{"role": r, "permissions": sorted(list(PERMS.get(r, set())))} for r in ROLES]
+
+# ────────────────────────────────────────────────────────────────────────────
+# AUDIT LOGS
+# ────────────────────────────────────────────────────────────────────────────
+@api.get("/audit-logs")
+async def list_audit(target_type: Optional[str]=None, action: Optional[str]=None,
+                     user_id: Optional[int]=None, frm: Optional[str]=Query(None, alias="from"),
+                     to: Optional[str]=None, limit: int=Query(200, le=2000),
+                     user=Depends(current_user)):
+    if user.get("role") not in ("admin", "manager"): raise HTTPException(403, "Admin/Manager only")
+    q = {}
+    if target_type: q["target_type"] = target_type
+    if action: q["action"] = action
+    if user_id: q["user_id"] = user_id
+    if frm: q["created_at"] = {"$gte": frm}
+    if to: q.setdefault("created_at", {})["$lte"] = to
+    rows = await db.audit_logs.find(q, {"_id":0}).sort("id", -1).limit(limit).to_list(limit)
+    return rows
+
+# ────────────────────────────────────────────────────────────────────────────
+# EXPORTS — CSV / Excel
+# ────────────────────────────────────────────────────────────────────────────
+import csv, io
+from fastapi.responses import StreamingResponse, Response
+
+EXPORT_SOURCES = {
+    "staff": ("staff", ["id","code","name","role","category","vendor","duty_tag","status","rating","mobile","address","qualification","experience","employment_type","salary","joining_date"]),
+    "patients": ("patients", ["id","reg_number","sgrh_reg","name","age","gender","mobile","address","hospital","diagnosis","doctor_name","service_location","category","status","blood_group"]),
+    "bookings": ("bookings", ["id","booking_id","patient_id","service_category","service_name","start_date","end_date","shift","staff_id","status","amount","paid_amount","balance","payment_status","created_by","created_at"]),
+    "bills":   ("bills", ["id","receipt_number","booking_id","patient_id","patient_name","service","amount","paid_amount","balance","payment_mode","payment_status","date"]),
+    "refunds": ("refunds", ["id","patient_id","amount","mode","reason","reason_category","status","initiator","verifier","approver","utr","bank_account","ifsc","initiated_at","approved_at"]),
+    "attendance": ("attendance", ["id","staff_id","date","login_time","logout_time","hours_worked","status"]),
+    "ambulance": ("ambulance_calls", ["id","call_number","caller_name","caller_mobile","patient_name","pickup_address","drop_address","call_type","ambulance_type","priority","assigned_driver","assigned_vehicle","status","amount","payment_status","created_at"]),
+    "leads": ("leads", ["id","caller_name","caller_mobile","relation","source","patient_name","patient_age","patient_gender","patient_address","diagnosis","service_needed","urgency","status","follow_up_date","created_at"]),
+    "audit_logs": ("audit_logs", ["id","user_id","user_name","user_role","action","target_type","target_id","notes","created_at"]),
+}
+
+@api.get("/exports/{entity}.csv")
+async def export_csv(entity: str, user=Depends(current_user)):
+    if entity not in EXPORT_SOURCES: raise HTTPException(404, "Unknown entity")
+    col, cols = EXPORT_SOURCES[entity]
+    rows = await db[col].find({}, {"_id":0}).to_list(20000)
+    buf = io.StringIO(); w = csv.writer(buf); w.writerow(cols)
+    for r in rows: w.writerow([r.get(c, "") for c in cols])
+    await audit(user, "export", entity, notes="csv")
+    return Response(content=buf.getvalue(), media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{entity}-{today()}.csv"'})
+
+@api.get("/exports/{entity}.xlsx")
+async def export_xlsx(entity: str, user=Depends(current_user)):
+    if entity not in EXPORT_SOURCES: raise HTTPException(404, "Unknown entity")
+    from openpyxl import Workbook
+    col, cols = EXPORT_SOURCES[entity]
+    rows = await db[col].find({}, {"_id":0}).to_list(20000)
+    wb = Workbook(); ws = wb.active; ws.title = entity[:31]
+    ws.append([c.replace("_"," ").title() for c in cols])
+    for r in rows: ws.append([r.get(c, "") if not isinstance(r.get(c), (dict, list)) else json.dumps(r.get(c)) for c in cols])
+    for i, _ in enumerate(cols, 1):
+        ws.column_dimensions[chr(64+i) if i<=26 else "AA"].width = 18
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0)
+    await audit(user, "export", entity, notes="xlsx")
+    return StreamingResponse(buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{entity}-{today()}.xlsx"'})
+
+# ────────────────────────────────────────────────────────────────────────────
+# PDF — Receipts, Payslips, Reports
+# ────────────────────────────────────────────────────────────────────────────
+def _pdf_bytes(builder):
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=18*mm, rightMargin=18*mm, topMargin=15*mm, bottomMargin=15*mm)
+    styles = getSampleStyleSheet()
+    builder(doc, styles, {"P":Paragraph,"T":Table,"TS":TableStyle,"S":Spacer,"colors":colors,"mm":mm,"H":ParagraphStyle})
+    buf.seek(0); return buf
+
+def _brand_header(P, styles):
+    return [
+        P("<para align='center'><font size=18 color='#7C3AED'><b>Reach Out</b></font><br/><font size=10>Healthcare Operations &mdash; An initiative of Sir Ganga Ram Hospital</font></para>", styles["Normal"]),
+    ]
+
+@api.get("/pdf/receipt/{bill_id}")
+async def pdf_receipt(bill_id: int, user=Depends(current_user)):
+    bill = await db.bills.find_one({"id": bill_id}, {"_id":0})
+    if not bill: raise HTTPException(404, "Bill not found")
+    patient = await db.patients.find_one({"id": bill.get("patient_id")}, {"_id":0}) or {}
+    watermark = bill.get("watermark","")
+    def build(doc, styles, k):
+        story = []
+        story += _brand_header(k["P"], styles)
+        story.append(k["S"](1, 6*k["mm"]))
+        story.append(k["P"](f"<para align='center'><font size=14><b>PAYMENT RECEIPT</b></font></para>", styles["Normal"]))
+        if watermark:
+            story.append(k["P"](f"<para align='center'><font color='#DC2626' size=22><b>{watermark}</b></font></para>", styles["Normal"]))
+        story.append(k["S"](1, 4*k["mm"]))
+        meta = [
+            ["Receipt No", bill.get("receipt_number",""), "Date", bill.get("date","")],
+            ["Booking ID", bill.get("booking_id",""), "Status", bill.get("payment_status","")],
+            ["Patient", patient.get("name", bill.get("patient_name","")), "Reg No", patient.get("reg_number","")],
+            ["Mobile", patient.get("mobile",""), "Mode", bill.get("payment_mode","")],
+        ]
+        t = k["T"](meta, colWidths=[30*k["mm"], 55*k["mm"], 25*k["mm"], 55*k["mm"]])
+        t.setStyle(k["TS"]([("FONTSIZE",(0,0),(-1,-1),9),("GRID",(0,0),(-1,-1),0.3,k["colors"].grey),("BACKGROUND",(0,0),(0,-1),k["colors"].HexColor("#F3F4F6")),("BACKGROUND",(2,0),(2,-1),k["colors"].HexColor("#F3F4F6"))]))
+        story.append(t)
+        story.append(k["S"](1, 5*k["mm"]))
+        rows = [["#","Description","Amount (INR)"],["1", bill.get("service",""), f"{bill.get('amount',0):,.2f}"]]
+        rows += [["", "Paid", f"{bill.get('paid_amount',0):,.2f}"], ["", "Balance", f"{bill.get('balance',0):,.2f}"]]
+        t2 = k["T"](rows, colWidths=[15*k["mm"], 115*k["mm"], 35*k["mm"]])
+        t2.setStyle(k["TS"]([("FONTSIZE",(0,0),(-1,-1),9),("GRID",(0,0),(-1,-1),0.3,k["colors"].grey),("BACKGROUND",(0,0),(-1,0),k["colors"].HexColor("#7C3AED")),("TEXTCOLOR",(0,0),(-1,0),k["colors"].white),("ALIGN",(2,0),(2,-1),"RIGHT")]))
+        story.append(t2)
+        story.append(k["S"](1, 8*k["mm"]))
+        story.append(k["P"]("<font size=8 color='#6B7280'>This is a system-generated receipt. For queries, contact Reach Out support.</font>", styles["Normal"]))
+        doc.build(story)
+    buf = _pdf_bytes(build)
+    await audit(user, "export", "receipt", bill_id, notes="pdf")
+    return StreamingResponse(buf, media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="receipt-{bill.get("receipt_number","")}.pdf"'})
+
+@api.get("/pdf/payslip/{staff_id}")
+async def pdf_payslip(staff_id: int, month: str = Query(...), user=Depends(current_user)):
+    s = await db.staff.find_one({"id": staff_id}, {"_id":0})
+    if not s: raise HTTPException(404, "Staff not found")
+    rec = await db.payroll_records.find_one({"staff_id": staff_id, "month": month}, {"_id":0})
+    if not rec:
+        # On-the-fly
+        att = await db.attendance.find({"staff_id": staff_id, "date": {"$regex": f"^{month}"}}).to_list(200)
+        present = sum(1 for a in att if a.get("status")=="Present")
+        monthly = _parse_salary(s.get("salary"))
+        gross = round((monthly / 26) * present) if present else 0
+        rec = {"month": month, "gross_pay": gross, "deductions": round(gross*0.02), "net_pay": gross - round(gross*0.02),
+               "days_payable": present, "total_hours": round(sum(a.get("hours_worked") or 0 for a in att), 2)}
+    def build(doc, styles, k):
+        story = _brand_header(k["P"], styles)
+        story.append(k["S"](1, 5*k["mm"]))
+        story.append(k["P"](f"<para align='center'><font size=14><b>PAYSLIP &mdash; {month}</b></font></para>", styles["Normal"]))
+        story.append(k["S"](1, 4*k["mm"]))
+        meta = [["Employee Code", s.get("code",""), "Name", s.get("name","")],
+                ["Role", s.get("role",""), "Vendor", s.get("vendor","")],
+                ["Employment Type", s.get("employment_type",""), "Mobile", s.get("mobile","")]]
+        t = k["T"](meta, colWidths=[35*k["mm"], 55*k["mm"], 25*k["mm"], 50*k["mm"]])
+        t.setStyle(k["TS"]([("FONTSIZE",(0,0),(-1,-1),9),("GRID",(0,0),(-1,-1),0.3,k["colors"].grey),("BACKGROUND",(0,0),(0,-1),k["colors"].HexColor("#F3F4F6")),("BACKGROUND",(2,0),(2,-1),k["colors"].HexColor("#F3F4F6"))]))
+        story.append(t); story.append(k["S"](1, 5*k["mm"]))
+        earn = [["Earnings","Amount (INR)"],["Basic / Gross Pay", f"{rec.get('gross_pay',0):,.2f}"]]
+        dedu = [["Deductions","Amount (INR)"],["Statutory Deductions", f"{rec.get('deductions',0):,.2f}"]]
+        et = k["T"](earn, colWidths=[80*k["mm"], 40*k["mm"]])
+        et.setStyle(k["TS"]([("FONTSIZE",(0,0),(-1,-1),9),("GRID",(0,0),(-1,-1),0.3,k["colors"].grey),("BACKGROUND",(0,0),(-1,0),k["colors"].HexColor("#10B981")),("TEXTCOLOR",(0,0),(-1,0),k["colors"].white),("ALIGN",(1,0),(1,-1),"RIGHT")]))
+        dt = k["T"](dedu, colWidths=[80*k["mm"], 40*k["mm"]])
+        dt.setStyle(k["TS"]([("FONTSIZE",(0,0),(-1,-1),9),("GRID",(0,0),(-1,-1),0.3,k["colors"].grey),("BACKGROUND",(0,0),(-1,0),k["colors"].HexColor("#EF4444")),("TEXTCOLOR",(0,0),(-1,0),k["colors"].white),("ALIGN",(1,0),(1,-1),"RIGHT")]))
+        story.append(et); story.append(k["S"](1, 3*k["mm"])); story.append(dt); story.append(k["S"](1, 5*k["mm"]))
+        net = k["T"]([["Net Pay", f"{rec.get('net_pay',0):,.2f}"]], colWidths=[80*k["mm"], 40*k["mm"]])
+        net.setStyle(k["TS"]([("FONTSIZE",(0,0),(-1,-1),11),("GRID",(0,0),(-1,-1),0.5,k["colors"].black),("BACKGROUND",(0,0),(-1,0),k["colors"].HexColor("#7C3AED")),("TEXTCOLOR",(0,0),(-1,0),k["colors"].white),("ALIGN",(1,0),(1,-1),"RIGHT"),("FONTNAME",(0,0),(-1,-1),"Helvetica-Bold")]))
+        story.append(net); story.append(k["S"](1, 6*k["mm"]))
+        story.append(k["P"](f"<font size=9>Days Payable: <b>{rec.get('days_payable',0)}</b> &nbsp;&nbsp; Total Hours: <b>{rec.get('total_hours',0)}</b></font>", styles["Normal"]))
+        story.append(k["S"](1, 8*k["mm"]))
+        story.append(k["P"]("<font size=8 color='#6B7280'>This is a system-generated payslip and does not require a signature.</font>", styles["Normal"]))
+        doc.build(story)
+    buf = _pdf_bytes(build)
+    await audit(user, "export", "payslip", staff_id, notes=month)
+    return StreamingResponse(buf, media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="payslip-{s.get("code","")}-{month}.pdf"'})
+
+@api.get("/pdf/report/{kind}")
+async def pdf_report(kind: str, frm: Optional[str]=Query(None, alias="from"), to: Optional[str]=None, user=Depends(current_user)):
+    if kind not in ("staff-summary","patient-summary","revenue-summary"):
+        raise HTTPException(404, "Unknown report")
+    if kind == "staff-summary":
+        rows = await staff_summary(frm=frm, to=to, vendor=None, user=user)
+        cols = [("name","Name"),("code","Code"),("role","Role"),("vendor","Vendor"),("days_worked","Days"),("total_hours","Hours"),("total_bookings","Bookings"),("rating","Rating")]
+        title = "Staff Summary Report"
+    elif kind == "patient-summary":
+        rows = await patient_summary(user=user)
+        cols = [("service_location","Location"),("category","Category"),("status","Status"),("count","Count")]
+        title = "Patient Summary Report"
+    else:
+        rows = await revenue_summary(frm=frm, to=to, user=user)
+        cols = [("month","Month"),("total_bills","Bills"),("total_billed","Billed"),("total_collected","Collected"),("total_pending","Pending"),("paid_count","Paid"),("pending_count","Unpaid")]
+        title = "Revenue Summary Report"
+
+    def build(doc, styles, k):
+        story = _brand_header(k["P"], styles); story.append(k["S"](1, 5*k["mm"]))
+        story.append(k["P"](f"<para align='center'><font size=14><b>{title}</b></font></para>", styles["Normal"]))
+        period = f"{frm or 'Start'} → {to or today()}"
+        story.append(k["P"](f"<para align='center'><font size=9 color='#6B7280'>Period: {period} &nbsp;|&nbsp; Generated: {now_iso()[:19]}</font></para>", styles["Normal"]))
+        story.append(k["S"](1, 5*k["mm"]))
+        header = [c[1] for c in cols]
+        data = [header] + [[(r.get(c[0]) if r.get(c[0]) is not None else "") for c in cols] for r in rows]
+        t = k["T"](data, repeatRows=1)
+        t.setStyle(k["TS"]([("FONTSIZE",(0,0),(-1,-1),8),("GRID",(0,0),(-1,-1),0.3,k["colors"].grey),("BACKGROUND",(0,0),(-1,0),k["colors"].HexColor("#7C3AED")),("TEXTCOLOR",(0,0),(-1,0),k["colors"].white),("ROWBACKGROUNDS",(0,1),(-1,-1),[k["colors"].white, k["colors"].HexColor("#F9FAFB")])]))
+        story.append(t)
+        doc.build(story)
+    buf = _pdf_bytes(build)
+    await audit(user, "export", kind, notes="pdf")
+    return StreamingResponse(buf, media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{kind}-{today()}.pdf"'})
 
 # ── Mount static & API ─────────────────────────────────────────────────────
 app.include_router(api)
