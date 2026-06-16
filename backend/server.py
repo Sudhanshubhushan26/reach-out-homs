@@ -1473,8 +1473,10 @@ def _pdf_bytes(builder):
     buf.seek(0); return buf
 
 def _brand_header(P, styles):
+    logo_path = ROOT_DIR.parent / "frontend" / "public" / "logo.svg"
+    # ReportLab needs raster — use the embedded SVG fallback path
     return [
-        P("<para align='center'><font size=18 color='#7C3AED'><b>Reach Out</b></font><br/><font size=10>Healthcare Operations &mdash; An initiative of Sir Ganga Ram Hospital</font></para>", styles["Normal"]),
+        P("<para align='center'><font size=18 color='#1E3A8A'><b>Reach Out</b></font><br/><font size=10 color='#DC2626'><b>An initiative of Sir Ganga Ram Trust Society</b></font><br/><font size=9 color='#1E40AF'><i>Care At Your Doorstep</i></font></para>", styles["Normal"]),
     ]
 
 @api.get("/pdf/receipt/{bill_id}")
