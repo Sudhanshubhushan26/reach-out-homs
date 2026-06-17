@@ -1122,7 +1122,13 @@ async def compliance_detail(sid: int, user=Depends(current_user)):
 @api.get("/consents")
 async def list_consents(patient_id: Optional[int]=None, user=Depends(current_user)):
     q = {"patient_id": patient_id} if patient_id else {}
-    return await list_col("consents", q)
+    rows = await list_col("consents", q)
+    pmap = {p["id"]: p for p in await list_col("patients")}
+    for r in rows:
+        p = pmap.get(r.get("patient_id"), {})
+        r["patient_name"] = p.get("name")
+        r["reg_number"] = p.get("reg_number")
+    return rows
 
 @api.post("/consents")
 async def add_consent(d: Dict[str, Any], user=Depends(current_user)):
@@ -1592,6 +1598,156 @@ async def pdf_report(kind: str, frm: Optional[str]=Query(None, alias="from"), to
     await audit(user, "export", kind, notes="pdf")
     return StreamingResponse(buf, media_type="application/pdf",
         headers={"Content-Disposition": f'inline; filename="{kind}-{today()}.pdf"'})
+
+@api.get("/pdf/patient/{pid}")
+async def pdf_patient(pid: int, user=Depends(current_user)):
+    """Generates a patient summary card PDF — registration details, diagnosis, medications, recent vitals."""
+    p = await db.patients.find_one({"id": pid}, {"_id":0})
+    if not p: raise HTTPException(404, "Patient not found")
+    bookings = await db.bookings.find({"patient_id": pid}, {"_id":0}).sort("id", -1).limit(5).to_list(5)
+    bills = await db.bills.find({"patient_id": pid}, {"_id":0}).to_list(20)
+    total_billed = sum(b.get("amount", 0) for b in bills)
+    total_paid = sum(b.get("paid_amount", 0) for b in bills)
+    latest_vitals = await db.medical_charts.find({"patient_id": pid, "chart_type": "vitals"}, {"_id":0}).sort("id", -1).limit(1).to_list(1)
+    vitals_data = {}
+    if latest_vitals:
+        try: vitals_data = json.loads(latest_vitals[0].get("chart_data") or "{}")
+        except: vitals_data = {}
+
+    def build(doc, styles, k):
+        story = _brand_header(k["P"], styles)
+        story.append(k["S"](1, 5*k["mm"]))
+        story.append(k["P"](f"<para align='center'><font size=14><b>PATIENT HEALTH SUMMARY</b></font></para>", styles["Normal"]))
+        story.append(k["S"](1, 4*k["mm"]))
+
+        # Identity card
+        ident = [
+            ["Reg No", p.get("reg_number",""), "SGRH No", p.get("sgrh_reg","-")],
+            ["Patient Name", p.get("name",""), "Age / Gender", f"{p.get('age','-')} / {p.get('gender','-')}"],
+            ["Mobile", p.get("mobile",""), "Blood Group", p.get("blood_group","-")],
+            ["Address", p.get("address","") or "-", "Status", p.get("status","Active")],
+        ]
+        t = k["T"](ident, colWidths=[30*k["mm"], 65*k["mm"], 30*k["mm"], 50*k["mm"]])
+        t.setStyle(k["TS"]([("FONTSIZE",(0,0),(-1,-1),9),("GRID",(0,0),(-1,-1),0.3,k["colors"].grey),
+            ("BACKGROUND",(0,0),(0,-1),k["colors"].HexColor("#F3F4F6")),
+            ("BACKGROUND",(2,0),(2,-1),k["colors"].HexColor("#F3F4F6")),
+            ("VALIGN",(0,0),(-1,-1),"TOP")]))
+        story.append(t); story.append(k["S"](1, 5*k["mm"]))
+
+        # Medical info
+        story.append(k["P"]("<font size=11 color='#1E40AF'><b>Medical Information</b></font>", styles["Normal"]))
+        story.append(k["S"](1, 2*k["mm"]))
+        med = [
+            ["Diagnosis", p.get("diagnosis","-")],
+            ["Treating Doctor", p.get("doctor_name","-")],
+            ["Hospital", p.get("hospital","-")],
+            ["Service Location", f"{p.get('service_location','-')} / {p.get('category','-')}"],
+            ["Current Medications", p.get("current_medications","-")],
+            ["Allergies", p.get("allergies","None")],
+        ]
+        t2 = k["T"](med, colWidths=[45*k["mm"], 130*k["mm"]])
+        t2.setStyle(k["TS"]([("FONTSIZE",(0,0),(-1,-1),9),("GRID",(0,0),(-1,-1),0.3,k["colors"].grey),
+            ("BACKGROUND",(0,0),(0,-1),k["colors"].HexColor("#EFF6FF")),("VALIGN",(0,0),(-1,-1),"TOP")]))
+        story.append(t2); story.append(k["S"](1, 5*k["mm"]))
+
+        # Latest vitals
+        if vitals_data:
+            story.append(k["P"]("<font size=11 color='#16A34A'><b>Latest Vitals</b></font>", styles["Normal"]))
+            story.append(k["S"](1, 2*k["mm"]))
+            v_rows = [[
+                f"Temp: {vitals_data.get('temperature','-')}°F",
+                f"BP: {vitals_data.get('bp','-')}",
+                f"Pulse: {vitals_data.get('pulse','-')}",
+                f"SpO2: {vitals_data.get('spo2','-')}%",
+            ]]
+            tv = k["T"](v_rows, colWidths=[44*k["mm"]]*4)
+            tv.setStyle(k["TS"]([("FONTSIZE",(0,0),(-1,-1),9),("GRID",(0,0),(-1,-1),0.3,k["colors"].grey),
+                ("BACKGROUND",(0,0),(-1,-1),k["colors"].HexColor("#F0FDF4")),("ALIGN",(0,0),(-1,-1),"CENTER")]))
+            story.append(tv); story.append(k["S"](1, 4*k["mm"]))
+
+        # Recent bookings
+        if bookings:
+            story.append(k["P"]("<font size=11 color='#7C3AED'><b>Recent Bookings (last 5)</b></font>", styles["Normal"]))
+            story.append(k["S"](1, 2*k["mm"]))
+            rows = [["Booking ID","Service","From","To","Status"]]
+            for b in bookings:
+                rows.append([b.get("booking_id",""), b.get("service_name","")[:30], b.get("start_date",""), b.get("end_date",""), b.get("status","")])
+            tb = k["T"](rows, colWidths=[32*k["mm"], 55*k["mm"], 28*k["mm"], 28*k["mm"], 22*k["mm"]])
+            tb.setStyle(k["TS"]([("FONTSIZE",(0,0),(-1,-1),8),("GRID",(0,0),(-1,-1),0.3,k["colors"].grey),
+                ("BACKGROUND",(0,0),(-1,0),k["colors"].HexColor("#7C3AED")),("TEXTCOLOR",(0,0),(-1,0),k["colors"].white)]))
+            story.append(tb); story.append(k["S"](1, 4*k["mm"]))
+
+        # Billing summary
+        story.append(k["P"]("<font size=11 color='#DC2626'><b>Billing Summary</b></font>", styles["Normal"]))
+        story.append(k["S"](1, 2*k["mm"]))
+        bsum = [["Total Billed", f"₹{total_billed:,.0f}", "Total Paid", f"₹{total_paid:,.0f}", "Outstanding", f"₹{total_billed-total_paid:,.0f}"]]
+        tbs = k["T"](bsum, colWidths=[30*k["mm"]]*6)
+        tbs.setStyle(k["TS"]([("FONTSIZE",(0,0),(-1,-1),9),("GRID",(0,0),(-1,-1),0.3,k["colors"].grey),
+            ("BACKGROUND",(0,0),(0,-1),k["colors"].HexColor("#FEF2F2")),
+            ("BACKGROUND",(2,0),(2,-1),k["colors"].HexColor("#FEF2F2")),
+            ("BACKGROUND",(4,0),(4,-1),k["colors"].HexColor("#FEF2F2")),
+            ("ALIGN",(1,0),(-1,-1),"RIGHT")]))
+        story.append(tbs)
+        story.append(k["S"](1, 8*k["mm"]))
+        story.append(k["P"](f"<font size=7 color='#6B7280'>Generated {now_iso()[:19]} • System-generated document • For internal use only</font>", styles["Normal"]))
+        doc.build(story)
+    buf = _pdf_bytes(build)
+    await audit(user, "export", "patient_summary", pid, notes="pdf")
+    return StreamingResponse(buf, media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="patient-{p.get("reg_number","")}.pdf"'})
+
+@api.get("/pdf/consent/{cid}")
+async def pdf_consent(cid: int, user=Depends(current_user)):
+    """Generates a signed consent form PDF."""
+    c = await db.consents.find_one({"id": cid}, {"_id":0})
+    if not c: raise HTTPException(404, "Consent not found")
+    p = await db.patients.find_one({"id": c.get("patient_id")}, {"_id":0}) or {}
+    def build(doc, styles, k):
+        story = _brand_header(k["P"], styles); story.append(k["S"](1, 5*k["mm"]))
+        story.append(k["P"](f"<para align='center'><font size=14><b>CONSENT FORM</b></font><br/><font size=10 color='#7C3AED'>{c.get('consent_type','')}</font></para>", styles["Normal"]))
+        story.append(k["S"](1, 5*k["mm"]))
+        meta = [
+            ["Patient Name", p.get("name",""), "Reg No", p.get("reg_number","")],
+            ["Age / Gender", f"{p.get('age','-')} / {p.get('gender','-')}", "Mobile", p.get("mobile","")],
+            ["Signed By", c.get("signed_by","") or p.get("name",""), "Relation", c.get("relation","Self")],
+            ["Date Signed", (c.get("signed_at") or c.get("created_at") or "")[:10], "Method", c.get("signature_method","Physical Signature")],
+        ]
+        t = k["T"](meta, colWidths=[30*k["mm"], 60*k["mm"], 25*k["mm"], 55*k["mm"]])
+        t.setStyle(k["TS"]([("FONTSIZE",(0,0),(-1,-1),9),("GRID",(0,0),(-1,-1),0.3,k["colors"].grey),
+            ("BACKGROUND",(0,0),(0,-1),k["colors"].HexColor("#F3F4F6")),
+            ("BACKGROUND",(2,0),(2,-1),k["colors"].HexColor("#F3F4F6"))]))
+        story.append(t); story.append(k["S"](1, 6*k["mm"]))
+
+        consent_body = c.get("signed_text") or (
+            f"I, {c.get('signed_by') or p.get('name','')} (relation: {c.get('relation','self')}), hereby give my informed consent for the procedure / service described as <b>{c.get('consent_type','')}</b> to be administered to the patient <b>{p.get('name','')}</b> (Reg No: {p.get('reg_number','')}).<br/><br/>"
+            "I have been explained the nature, purpose, expected benefits and potential risks of this service in a language I understand. I have had the opportunity to ask questions, and all my queries have been answered satisfactorily.<br/><br/>"
+            "I understand that I may withdraw my consent at any time, and I authorize the Reach Out clinical team — an initiative of Sir Ganga Ram Trust Society — to deliver the service in accordance with applicable medical standards.<br/>"
+        )
+        story.append(k["P"](f"<font size=10>{consent_body}</font>", styles["Normal"]))
+        story.append(k["S"](1, 10*k["mm"]))
+        if c.get("notes"):
+            story.append(k["P"](f"<font size=9 color='#6B7280'><b>Notes:</b> {c.get('notes','')}</font>", styles["Normal"]))
+            story.append(k["S"](1, 5*k["mm"]))
+
+        sig = [
+            ["Patient / Guardian Signature", "", "Witness / Clinician Signature", ""],
+            ["", c.get("signed_by") or p.get("name",""), "", c.get("witness_name","")],
+            ["Date", (c.get("signed_at") or c.get("created_at") or "")[:10], "Status", c.get("status","Signed")],
+        ]
+        ts = k["T"](sig, colWidths=[40*k["mm"], 50*k["mm"], 40*k["mm"], 40*k["mm"]])
+        ts.setStyle(k["TS"]([("FONTSIZE",(0,0),(-1,-1),9),("GRID",(0,0),(-1,-1),0.3,k["colors"].grey),
+            ("VALIGN",(0,0),(-1,-1),"TOP"),("LINEBELOW",(1,0),(1,1),0.5,k["colors"].black),
+            ("LINEBELOW",(3,0),(3,1),0.5,k["colors"].black),
+            ("BACKGROUND",(0,0),(0,-1),k["colors"].HexColor("#F3F4F6")),
+            ("BACKGROUND",(2,0),(2,-1),k["colors"].HexColor("#F3F4F6"))]))
+        story.append(ts)
+        story.append(k["S"](1, 6*k["mm"]))
+        story.append(k["P"](f"<font size=7 color='#6B7280'>Generated {now_iso()[:19]} • Consent ID: {c.get('id')} • This is a system-generated document.</font>", styles["Normal"]))
+        doc.build(story)
+    buf = _pdf_bytes(build)
+    await audit(user, "export", "consent", cid, notes="pdf")
+    return StreamingResponse(buf, media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="consent-{cid}.pdf"'})
 
 # ════════════════════════════════════════════════════════════════════════════
 # PHASE 2: Missing-feature build-out

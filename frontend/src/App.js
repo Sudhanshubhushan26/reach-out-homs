@@ -1767,6 +1767,7 @@ function PatientModule({ auth, user }) {
               <Btn small color={C.primary} onClick={e=>{ e.stopPropagation(); openProfile(p); }}>View</Btn>
               <Btn small outline onClick={e=>{ e.stopPropagation(); openEdit(p); }}>Edit</Btn>
               <Btn small color={C.green} onClick={e=>{ e.stopPropagation(); openDocs(p); }}>Docs</Btn>
+              <Btn small color={C.indigo} onClick={e=>{ e.stopPropagation(); downloadPdf(`/pdf/patient/${p.id}`, `patient-${p.reg_number||p.id}.pdf`); }}>📄 PDF</Btn>
               {user?.role==="admin" && <Btn small color={p.frozen?C.amber:C.muted} onClick={e=>{ e.stopPropagation(); toggleFreeze(p); }}>{p.frozen?"🔓":"🔒"}</Btn>}
             </div>
           )},
@@ -2114,7 +2115,12 @@ function BillingModule({ auth }) {
           { label:"Mode",key:"payment_mode" },
           { label:"Status",render:b=><><Badge color={statusColor(b.payment_status)}>{b.payment_status}</Badge>{b.watermark&&<span style={{ color:C.red,fontSize:10,marginLeft:4,fontWeight:700 }}>REFUND</span>}</> },
           { label:"Date",key:"date" },
-          { label:"",render:b=>b.payment_status!=="Paid"&&<Btn small color={C.green} onClick={e=>{ e.stopPropagation(); setSelected(b); setPayForm({ amount:b.balance||"", mode:"Cash" }); setShowPay(true); }}>Pay</Btn> },
+          { label:"",render:b=>(
+            <div style={{display:"flex",gap:4}}>
+              <Btn small outline color={C.indigo} onClick={e=>{ e.stopPropagation(); downloadPdf(`/pdf/receipt/${b.id}`, `receipt-${b.receipt_number||b.id}.pdf`); }}>📄 PDF</Btn>
+              {b.payment_status!=="Paid"&&<Btn small color={C.green} onClick={e=>{ e.stopPropagation(); setSelected(b); setPayForm({ amount:b.balance||"", mode:"Cash" }); setShowPay(true); }}>Pay</Btn>}
+            </div>
+          )},
         ]} rows={bills} />
       </Card>
       <Modal open={showPay} title={`Record Payment — ${selected?.receipt_number}`} onClose={()=>setShowPay(false)}>
@@ -2911,6 +2917,7 @@ function ConsentModule({ auth }) {
           { label:"Relation",key:"relation" },
           { label:"Status",render:c=><Badge color="green">{c.status}</Badge> },
           { label:"Date",render:c=>c.created_at?.split("T")[0] },
+          { label:"",render:c=><Btn small outline color={C.indigo} onClick={()=>downloadPdf(`/pdf/consent/${c.id}`, `consent-${c.id}.pdf`)}>📄 PDF</Btn> },
         ]} rows={consents} />
       </Card>
       <Modal open={showForm} title="Record Patient Consent" onClose={()=>setShowForm(false)} wide>
