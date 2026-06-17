@@ -1,60 +1,57 @@
 # Reach Out Healthcare Operations Management System — PRD
 
 ## Problem
-Migrate the existing Node.js/SQLite + React Reach Out app to FastAPI + MongoDB + React and complete all 10 production-critical modules described in the requirements doc.
+Migrate from Node.js/SQLite to FastAPI + MongoDB + React and complete all production-critical features including mobile-ready Patient/Staff app endpoints, smart allocation, notifications, payroll, geofencing.
 
 ## Architecture
-- **Backend**: FastAPI + Motor (async MongoDB) + JWT auth + bcrypt + ReportLab + openpyxl
-- **Frontend**: React 19 (existing App.jsx preserved, API URL switched to env)
-- **Storage**: MongoDB collections, file uploads under /app/backend/uploads served via /api/uploads
+- Backend: FastAPI + Motor (async MongoDB) + JWT/bcrypt + ReportLab + openpyxl
+- Frontend: React 19 (existing App.jsx preserved)
+- Storage: MongoDB collections + filesystem uploads
 
-## Modules Delivered (all 10)
-1. ✅ Staff Allocation Engine — location/vendor/skill/duty/availability/rating-sorted
-2. ✅ Roster Engine — weekly + monthly views, conflict detection, summary aggregation
-3. ✅ Medical Charts — vitals/BP/sugar/I-O/MAR/nursing/physio + per-patient trends
-4. ✅ Payroll Automation — auto-compute from attendance, vendor-wise, monthly generation, PDF payslips
-5. ✅ Booking Lifecycle — Lead → Patient → Booking → Bill → Reassignment → Feedback (30-day Booking ID)
-6. ✅ Notification Engine — in-app queue + hook stubs for WhatsApp/SMS
-7. ✅ Compliance Engine — role-based required docs, expiry alerts, AMC/CMC alerts, dashboard
-8. ✅ Analytics Engine — revenue trends, service demand, staff performance, ambulance stats, patient categories
-9. ✅ Reports Engine — staff/patient/revenue summaries with date+vendor filters
-10. ✅ Payment Integration — Razorpay placeholders + 3-tier refund workflow with identity/bank capture
+## All Modules Delivered
 
-## Phase 1 Polish (just completed)
-- ✅ Multi-role users (admin / manager / supervisor / accountant / foe) with permission map
-- ✅ Audit logs collection — every write action recorded with user, role, target, before/after
-- ✅ PDF generation — receipts, payslips, reports (ReportLab, branded purple header)
-- ✅ Excel + CSV export — staff, patients, bookings, bills, refunds, attendance, ambulance, leads, audit logs
-- ✅ Weighted rating formula — 40/20/15/10/10/5 source weights (patient/family/punctuality/TAT/training/supervisor)
-- ✅ Refund identity + bank capture — relative name, relation, govt ID, bank/UPI, ID proof + cancelled cheque upload, masked bank account after save
+### Phase 1 — Core (done)
+1. ✅ Authentication & Multi-Role RBAC (5 roles: admin, manager, supervisor, accountant, foe)
+2. ✅ Staff Management — profile, RO### code, documents, ratings (weighted), duty tags, vendor mapping
+3. ✅ Patient Management — reg numbers, freeze/unfreeze (admin-only), categorization, documents
+4. ✅ Leads & Service Booking — Lead→Booking→Bill→Reassignment with 30-day BookingID
+5. ✅ Billing & Refunds — 3-tier refund (initiate→verify→approve), identity+bank capture, masked storage
+6. ✅ Roster Engine — conflict detection, summary aggregation
+7. ✅ Medical Charts — 6 types (vitals/BP/sugar/I-O/MAR/notes), trends, latest-vitals
+8. ✅ Compliance Engine — role-based required docs, expiry alerts, AMC/CMC
+9. ✅ Analytics — revenue, demand, performance, ambulance, categories
+10. ✅ Reports — staff/patient/revenue summaries, date+vendor filters
+11. ✅ Audit Logs — every write tracked with user/role/before/after
+12. ✅ PDF/CSV/XLSX exports — receipts, payslips, reports, all major entities
+13. ✅ Ambulance — call logging, ALS/BLS/transport, payment tracking
+14. ✅ Assets — inventory, AMC/CMC dates, expiry alerts
+15. ✅ Training + MCQ — question bank, scoring, rating contribution
 
-## What's Implemented (Backend Surface)
-- 105+ FastAPI endpoints under `/api`
-- 5 seeded users across 5 roles
-- 10 staff + 7 patients + 2 bookings + 2 ambulance calls + 5 leads + 4 vendors + 3 assets
-- JWT + bcrypt auth, RBAC via PERMS map, audit logging on user/refund/rating/export actions
-- File uploads for staff/patient/refund documents
-- PDF (receipt, payslip, report) + CSV/XLSX exports per major entity
+### Phase 2 — Missing-feature build-out (just delivered)
+16. ✅ **Notification Templates + Queue** — 7 seeded templates (booking/payment/expiry/refund/roster/OTP/feedback), `/api/notif-templates` CRUD, `/api/notifications/send` (template-driven), `/api/notifications/dispatch` (mock dispatcher across whatsapp/sms/email/in-app)
+17. ✅ **OTP Service** — `/api/otp/send` + `/api/otp/verify` with 6-digit code, 5-min expiry, 5-attempt cap. Auto-detects patient vs staff by mobile and returns scoped JWT
+18. ✅ **Auto Roster Allocation Engine** — `/api/roster/auto-allocate` with weighted scoring (40% rating, 25% availability, 20% vendor match, 10% role match, 5% location proximity) + optional commit
+19. ✅ **Geofencing** — `/api/roster/{rid}/geofence` to set fence; `/api/attendance/login-geo` validates GPS via Haversine
+20. ✅ **NPS Analytics** — `/api/analytics/nps` (promoter/passive/detractor) from feedback
+21. ✅ **Predictive Analytics** — `/api/analytics/revenue-forecast` (linear regression, 1–12 month horizon) + `/api/analytics/staff-demand-forecast`
+22. ✅ **Inventory + Equipment Lending** — `/api/inventory`, `/api/lendings` with stock decrement on lend, deposit/damage/refund on return
+23. ✅ **Advanced Payroll Breakdown** — `/api/payroll/{staff_id}/details?month=...` with basic+HRA+conveyance+overtime / PF+ESI+PT+TDS+leave_deduction
+24. ✅ **Incident Workflow** — `/api/incidents/{id}/assign-investigator`, `/findings`, `/close`
+25. ✅ **Patient App** (mobile-ready) — `/api/patient-app/{me, my-bookings, my-bills, my-charts, request-service, feedback, consent}`
+26. ✅ **Staff App** (mobile-ready) — `/api/staff-app/{me, my-roster, my-payslips, my-trainings, raise-incident, submit-chart}` + geofenced attendance
 
 ## Test Credentials
-See `test_credentials.md` for all 5 role accounts.
+admin/Admin@1234 • manager/Manager@1234 • supervisor/Super@1234 • accountant/Account@1234 • foe/Foe@1234
 
-## Backlog / Future
-### P0 — Need API keys from user
-- Real WhatsApp Cloud API (currently queue stub)
-- Real SMS gateway / Twilio (currently queue stub)
-- Real Razorpay live keys + webhook
-### P1 — Mobile + Tracking (6–8 weeks)
-- Patient mobile app (React Native): consent e-sign, payments, feedback, doc uploads
-- Staff mobile app: attendance with selfie+GPS, offline chart sync, training, incident reporting
-- Geofencing per assignment + live GPS tracking
-- Push notifications
-### P2 — Deep features
-- Stock issue + Lending tracking
-- Longitudinal patient analytics (readmission, upgrade/downgrade, conversion)
-- Auto-logout after 2hrs inactivity
-- Document expiry escalation L1→L2→L3 (30/15/7 day reminders)
-- Hospital GAB system integration
-### P3 — Optional priced add-ons
-- AI predictive analytics
-- AI referral pattern analytics
+Patient/Staff app login via OTP on registered mobile (e.g., 9811001001 = Nitin Gupta).
+
+## Stats
+- 130+ API endpoints under `/api`
+- 25 MongoDB collections (users, staff, patients, bookings, bills, refunds, leads, ambulance, vendors, assets, roster, attendance, medical_charts, notifications, notif_templates, audit_logs, training, mcq_questions, mcq_results, payroll_records, consents, feedback, incidents, inventory_items, lendings, counters, freeze_log, ratings, documents)
+
+## Pending (Future Sprints)
+- **P0** — Real provider plug-ins: WhatsApp Cloud API (Meta), Twilio/MSG91 SMS, Razorpay live keys + webhook. All hook points are wired — only credentials + provider client wrappers needed.
+- **P1** — Native mobile apps (React Native) — endpoints exist, UI to be built
+- **P1** — Live GPS tracking during duty (websocket-based)
+- **P2** — Hospital GAB system integration
+- **P3** — AI predictive analytics add-on (separately priced)

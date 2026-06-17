@@ -1593,6 +1593,574 @@ async def pdf_report(kind: str, frm: Optional[str]=Query(None, alias="from"), to
     return StreamingResponse(buf, media_type="application/pdf",
         headers={"Content-Disposition": f'inline; filename="{kind}-{today()}.pdf"'})
 
+# ════════════════════════════════════════════════════════════════════════════
+# PHASE 2: Missing-feature build-out
+# ════════════════════════════════════════════════════════════════════════════
+import math as _math
+
+def _haversine_m(lat1, lng1, lat2, lng2):
+    if None in (lat1, lng1, lat2, lng2): return None
+    R = 6371000
+    p1, p2 = _math.radians(lat1), _math.radians(lat2)
+    dp, dl = _math.radians(lat2-lat1), _math.radians(lng2-lng1)
+    a = _math.sin(dp/2)**2 + _math.cos(p1)*_math.cos(p2)*_math.sin(dl/2)**2
+    return 2 * R * _math.asin(_math.sqrt(a))
+
+# ────────────────────────────────────────────────────────────────────────────
+# NOTIFICATION TEMPLATES + QUEUE (WhatsApp / SMS / Email / In-App)
+# ────────────────────────────────────────────────────────────────────────────
+DEFAULT_TEMPLATES = [
+    ("booking_confirm","Booking Confirmation","whatsapp","Hi {{name}}, your booking {{booking_id}} for {{service}} is confirmed from {{start_date}} to {{end_date}}. Amount: ₹{{amount}}. — Reach Out"),
+    ("payment_reminder","Payment Reminder","sms","Dear {{name}}, your booking {{booking_id}} has a pending balance of ₹{{balance}}. Please pay at your earliest. — Reach Out"),
+    ("doc_expiry","Document Expiry","whatsapp","Dear {{staff_name}} ({{code}}), your {{document_type}} expires on {{expiry_date}}. Please renew. — Reach Out"),
+    ("refund_approved","Refund Approved","sms","Dear {{name}}, refund of ₹{{amount}} for booking {{booking_id}} has been approved (UTR: {{utr}}). — Reach Out"),
+    ("roster_assigned","Duty Assignment","whatsapp","Hi {{staff_name}}, you are assigned to {{patient_name}} on {{date}} ({{shift}}). Address: {{address}}. — Reach Out"),
+    ("otp_login","Login OTP","sms","Your Reach Out OTP is {{otp}}. Valid for 5 minutes. Do not share."),
+    ("feedback_request","Feedback Request","whatsapp","Hi {{name}}, please rate your recent service: {{link}}. — Reach Out"),
+]
+
+async def _seed_templates():
+    if await db.notif_templates.count_documents({}) == 0:
+        for code, name, channel, body in DEFAULT_TEMPLATES:
+            await db.notif_templates.insert_one({"id": await next_id("notif_templates"),
+                "code": code, "name": name, "channel": channel, "body": body,
+                "status":"Active", "created_at": now_iso()})
+
+def render_template(body: str, ctx: Dict[str, Any]) -> str:
+    out = body
+    for k, v in (ctx or {}).items():
+        out = out.replace("{{"+str(k)+"}}", str(v) if v is not None else "")
+    return re.sub(r"\{\{[^}]+\}\}", "", out)
+
+@api.get("/notif-templates")
+async def list_templates(user=Depends(current_user)):
+    return await list_col("notif_templates", sort=("code", 1))
+
+@api.post("/notif-templates")
+async def add_template(d: Dict[str, Any], user=Depends(current_user)):
+    if user.get("role") not in ("admin","manager"): raise HTTPException(403, "Admin/Manager only")
+    tid = await next_id("notif_templates")
+    await db.notif_templates.insert_one({"id": tid, "status":"Active", "created_at": now_iso(), **d})
+    await audit(user, "create", "notif_template", tid, after=d); return {"id": tid, "message":"Template created"}
+
+@api.put("/notif-templates/{tid}")
+async def upd_template(tid: int, d: Dict[str, Any], user=Depends(current_user)):
+    if user.get("role") not in ("admin","manager"): raise HTTPException(403, "Admin/Manager only")
+    d.pop("id", None); d.pop("_id", None)
+    await db.notif_templates.update_one({"id": tid}, {"$set": d})
+    await audit(user, "update", "notif_template", tid, after=d); return {"message":"Template updated"}
+
+@api.post("/notifications/send")
+async def send_notification(d: Dict[str, Any], user=Depends(current_user)):
+    """Render template and enqueue. Supports whatsapp/sms/email/in-app channels."""
+    tpl = None
+    if d.get("template_code"): tpl = await db.notif_templates.find_one({"code": d["template_code"]})
+    elif d.get("template_id"): tpl = await db.notif_templates.find_one({"id": d["template_id"]})
+    if tpl:
+        body = render_template(tpl.get("body",""), d.get("variables") or {})
+        channel = d.get("channel") or tpl.get("channel","in-app")
+    else:
+        body = d.get("body","")
+        channel = d.get("channel","in-app")
+    nid = await next_id("notifications")
+    rec = {"id": nid, "channel": channel, "recipient_type": d.get("recipient_type","patient"),
+           "recipient_id": d.get("recipient_id"), "recipient_phone": d.get("recipient_phone"),
+           "recipient_email": d.get("recipient_email"), "title": d.get("title",""),
+           "message": body, "template_id": (tpl or {}).get("id"),
+           "status":"Pending", "attempts": 0, "created_at": now_iso()}
+    await db.notifications.insert_one(rec)
+    return {"id": nid, "channel": channel, "preview": body, "message":"Queued"}
+
+@api.post("/notifications/dispatch")
+async def dispatch_queue(user=Depends(current_user)):
+    """Mock dispatcher — flips Pending notifications to Sent. Real WhatsApp/SMS providers plug in here."""
+    if user.get("role") not in ("admin","manager"): raise HTTPException(403, "Admin/Manager only")
+    pending = await db.notifications.find({"status":"Pending"}).to_list(500)
+    sent = 0
+    for n in pending:
+        # In production: call WhatsApp Cloud API / Twilio / SendGrid here based on n["channel"]
+        await db.notifications.update_one({"id": n["id"]}, {"$set": {
+            "status":"Sent","sent_at": now_iso(),"provider_ref": f"MOCK-{n['id']}-{int(datetime.now().timestamp())}",
+            "attempts": (n.get("attempts") or 0) + 1}})
+        sent += 1
+    await audit(user, "dispatch", "notification_queue", notes=f"sent {sent}")
+    return {"dispatched": sent, "channel_breakdown": {c: sum(1 for n in pending if n.get("channel")==c) for c in ["whatsapp","sms","email","in-app"]}}
+
+@api.get("/notifications/queue")
+async def queue_status(status: Optional[str]=None, user=Depends(current_user)):
+    q = {}
+    if status: q["status"] = status
+    rows = await db.notifications.find(q, {"_id":0}).sort("id", -1).limit(200).to_list(200)
+    counts = await db.notifications.aggregate([{"$group":{"_id":"$status","n":{"$sum":1}}}]).to_list(10)
+    return {"items": rows, "counts": {c["_id"]: c["n"] for c in counts}}
+
+# ────────────────────────────────────────────────────────────────────────────
+# OTP SERVICE  (for Patient App / Staff App login)
+# ────────────────────────────────────────────────────────────────────────────
+OTP_STORE: Dict[str, Dict[str, Any]] = {}  # phone -> {otp, exp, attempts}
+
+@api.post("/otp/send")
+async def otp_send(body: Dict[str, Any]):
+    phone = (body.get("phone") or "").strip()
+    if not re.match(r"^\d{10,15}$", phone): raise HTTPException(400, "Valid phone required")
+    code = f"{random.randint(0, 999999):06d}"
+    OTP_STORE[phone] = {"otp": code, "exp": (datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat(), "attempts": 0}
+    # Enqueue OTP via template
+    tpl = await db.notif_templates.find_one({"code":"otp_login"})
+    msg = render_template((tpl or {}).get("body","Your Reach Out OTP is {{otp}}"), {"otp": code})
+    await db.notifications.insert_one({"id": await next_id("notifications"), "channel":"sms",
+        "recipient_phone": phone, "message": msg, "title":"Login OTP",
+        "status":"Pending", "created_at": now_iso()})
+    return {"message":"OTP sent", "dev_otp": code if os.environ.get("EXPOSE_OTP","1") == "1" else None}
+
+@api.post("/otp/verify")
+async def otp_verify(body: Dict[str, Any]):
+    phone, otp = (body.get("phone") or "").strip(), (body.get("otp") or "").strip()
+    rec = OTP_STORE.get(phone)
+    if not rec: raise HTTPException(400, "OTP not requested")
+    if datetime.now(timezone.utc) > datetime.fromisoformat(rec["exp"]):
+        OTP_STORE.pop(phone, None); raise HTTPException(400, "OTP expired")
+    rec["attempts"] = rec.get("attempts",0) + 1
+    if rec["attempts"] > 5: OTP_STORE.pop(phone, None); raise HTTPException(429, "Too many attempts")
+    if otp != rec["otp"]: raise HTTPException(401, "Wrong OTP")
+    OTP_STORE.pop(phone, None)
+    # Find patient or staff
+    patient = await db.patients.find_one({"mobile": phone})
+    staff = await db.staff.find_one({"mobile": phone})
+    if patient:
+        token = make_token({"id": patient["id"], "role":"patient", "name": patient.get("name")})
+        return {"token": token, "role":"patient", "id": patient["id"], "name": patient.get("name"), "reg_number": patient.get("reg_number")}
+    if staff:
+        token = make_token({"id": staff["id"], "role":"staff", "name": staff.get("name")})
+        return {"token": token, "role":"staff", "id": staff["id"], "name": staff.get("name"), "code": staff.get("code")}
+    raise HTTPException(404, "No patient or staff registered with this number")
+
+# ────────────────────────────────────────────────────────────────────────────
+# AUTO ROSTER / SMART STAFF ALLOCATION ENGINE
+# ────────────────────────────────────────────────────────────────────────────
+@api.post("/roster/auto-allocate")
+async def auto_allocate(d: Dict[str, Any], user=Depends(current_user)):
+    """Suggest best staff for a booking using weighted scoring:
+       40% rating, 25% availability, 20% vendor match, 10% role match, 5% location proximity."""
+    patient_id = d.get("patient_id")
+    start_date = d.get("start_date") or today()
+    end_date = d.get("end_date") or start_date
+    shift = d.get("shift","Morning")
+    role = d.get("role"); vendor_pref = d.get("vendor")
+    commit = bool(d.get("commit", False))
+    patient = await db.patients.find_one({"id": patient_id}) if patient_id else None
+    q = {"status":"Active","duty_tag":{"$nin":["Suspended","Terminated","On Leave"]}}
+    if role: q["role"] = role
+    staff_list = await list_col("staff", q)
+    suggestions = []
+    for s in staff_list:
+        # availability: check overlapping roster
+        clash = await db.roster.count_documents({"staff_id": s["id"], "date": {"$gte": start_date, "$lte": end_date}, "shift": shift})
+        active_bk = await db.bookings.count_documents({"staff_id": s["id"], "status":"Active"})
+        if clash > 0: continue
+        rating_score = (float(s.get("rating") or 0) / 5.0) * 40
+        avail_score = 25 if s.get("duty_tag")=="Available" else (12 if active_bk == 0 else 0)
+        vendor_score = 20 if vendor_pref and s.get("vendor")==vendor_pref else (10 if not vendor_pref else 0)
+        role_score = 10 if (not role or s.get("role")==role) else 0
+        loc_score = 0
+        if patient and s.get("address") and patient.get("address"):
+            # crude proximity: substring city match
+            tokens_p = set(re.findall(r"\w+", (patient.get("address") or "").lower()))
+            tokens_s = set(re.findall(r"\w+", (s.get("address") or "").lower()))
+            shared = len(tokens_p & tokens_s)
+            loc_score = min(5, shared)
+        total = rating_score + avail_score + vendor_score + role_score + loc_score
+        suggestions.append({"id": s["id"], "code": s.get("code"), "name": s.get("name"),
+            "role": s.get("role"), "vendor": s.get("vendor"), "rating": s.get("rating",0),
+            "duty_tag": s.get("duty_tag"), "active_bookings": active_bk,
+            "score": round(total, 2),
+            "breakdown": {"rating": round(rating_score,1), "availability": avail_score,
+                          "vendor_match": vendor_score, "role_match": role_score, "location": loc_score}})
+    suggestions.sort(key=lambda x: x["score"], reverse=True)
+    top = suggestions[:int(d.get("top", 5))]
+    created = []
+    if commit and top:
+        chosen = top[0]
+        cur = start_date
+        while cur <= end_date:
+            try:
+                await db.roster.insert_one({"id": await next_id("roster"), "staff_id": chosen["id"],
+                    "patient_id": patient_id, "date": cur, "shift": shift,
+                    "status":"Scheduled", "service": d.get("service_name"),
+                    "auto_allocated": True, "created_at": now_iso()})
+                created.append(cur)
+            except Exception: pass
+            cur = (datetime.fromisoformat(cur) + timedelta(days=1)).date().isoformat()
+        await audit(user, "auto_allocate", "roster", chosen["id"], after={"dates": created, "patient_id": patient_id})
+    return {"suggestions": top, "committed": created}
+
+# ────────────────────────────────────────────────────────────────────────────
+# GEOFENCING — store fence per roster, validate on attendance
+# ────────────────────────────────────────────────────────────────────────────
+@api.patch("/roster/{rid}/geofence")
+async def set_geofence(rid: int, body: Dict[str, Any], user=Depends(current_user)):
+    lat = float(body.get("lat")); lng = float(body.get("lng")); radius = int(body.get("radius_m", 200))
+    await db.roster.update_one({"id": rid}, {"$set": {"geofence": {"lat": lat, "lng": lng, "radius_m": radius}}})
+    return {"message": "Geofence set", "lat": lat, "lng": lng, "radius_m": radius}
+
+@api.post("/attendance/login-geo")
+async def att_login_geo(staff_id: int = Form(...), lat: float = Form(...), lng: float = Form(...),
+                        roster_id: Optional[int] = Form(None), photo: Optional[UploadFile] = File(None)):
+    """Geofenced attendance login. Rejects if outside fence."""
+    d = today()
+    if await db.attendance.find_one({"staff_id": staff_id, "date": d, "logout_time": None}):
+        raise HTTPException(400, "Already clocked in today")
+    distance = None; status = "Present"
+    if roster_id:
+        r = await db.roster.find_one({"id": roster_id})
+        gf = (r or {}).get("geofence")
+        if gf:
+            distance = _haversine_m(lat, lng, gf["lat"], gf["lng"])
+            if distance and distance > gf.get("radius_m", 200):
+                raise HTTPException(400, f"Outside geofence: {distance:.0f}m from site (allowed: {gf['radius_m']}m)")
+    pp = ""
+    if photo:
+        path = UPLOAD_DIR / "staff" / f"clock-{staff_id}-{int(datetime.now().timestamp()*1000)}.jpg"
+        path.write_bytes(await photo.read()); pp = str(path.relative_to(ROOT_DIR))
+    aid = await next_id("attendance")
+    await db.attendance.insert_one({"id": aid, "staff_id": staff_id, "date": d, "login_time": now_iso(),
+        "login_lat": lat, "login_lng": lng, "login_photo": pp,
+        "roster_id": roster_id, "distance_from_site_m": round(distance) if distance else None,
+        "status": status})
+    await db.staff.update_one({"id": staff_id}, {"$set": {"duty_tag":"On Duty"}})
+    return {"id": aid, "distance_m": round(distance) if distance else None, "message":"Clocked in"}
+
+# ────────────────────────────────────────────────────────────────────────────
+# NPS + REVENUE FORECAST
+# ────────────────────────────────────────────────────────────────────────────
+@api.get("/analytics/nps")
+async def nps(user=Depends(current_user)):
+    """NPS from feedback.service_rating (5=promoter, 4=passive, ≤3=detractor)."""
+    pipe = [{"$match":{"service_rating":{"$exists":True}}},
+            {"$group":{"_id":None,
+                "promoters":{"$sum":{"$cond":[{"$gte":["$service_rating",5]},1,0]}},
+                "passives":{"$sum":{"$cond":[{"$eq":["$service_rating",4]},1,0]}},
+                "detractors":{"$sum":{"$cond":[{"$lte":["$service_rating",3]},1,0]}},
+                "total":{"$sum":1}}}]
+    a = await db.feedback.aggregate(pipe).to_list(1)
+    if not a: return {"nps": None, "promoters":0, "passives":0, "detractors":0, "total":0}
+    r = a[0]; t = r["total"] or 1
+    nps_score = round(((r["promoters"] - r["detractors"]) / t) * 100, 1)
+    return {"nps": nps_score, "promoters": r["promoters"], "passives": r["passives"],
+            "detractors": r["detractors"], "total": r["total"],
+            "promoter_pct": round(r["promoters"]/t*100,1),
+            "detractor_pct": round(r["detractors"]/t*100,1)}
+
+@api.get("/analytics/revenue-forecast")
+async def revenue_forecast(months: int = Query(3, ge=1, le=12), user=Depends(current_user)):
+    """Simple linear regression on monthly revenue → forecast next N months."""
+    hist = await monthly_rev(user)
+    hist = list(reversed(hist))[-12:]  # ascending, last 12
+    if len(hist) < 2:
+        return {"history": hist, "forecast": [], "note": "Need 2+ months of data"}
+    n = len(hist); xs = list(range(n)); ys = [h["revenue"] for h in hist]
+    mean_x = sum(xs)/n; mean_y = sum(ys)/n
+    num = sum((xs[i]-mean_x)*(ys[i]-mean_y) for i in range(n))
+    den = sum((xs[i]-mean_x)**2 for i in range(n)) or 1
+    slope = num/den; intercept = mean_y - slope*mean_x
+    last_month = datetime.strptime(hist[-1]["month"], "%Y-%m")
+    forecast = []
+    for i in range(1, months+1):
+        nxt = last_month + timedelta(days=32*i); nxt = nxt.replace(day=1)
+        pred = max(0, round(slope*(n+i-1) + intercept))
+        forecast.append({"month": nxt.strftime("%Y-%m"), "predicted_revenue": pred,
+                         "confidence": "high" if n >= 6 else "low"})
+    return {"history": hist, "forecast": forecast,
+            "trend": "growing" if slope > 0 else "declining", "slope_per_month": round(slope, 2)}
+
+@api.get("/analytics/staff-demand-forecast")
+async def staff_demand(user=Depends(current_user)):
+    """Forecast staff required from booking pipeline."""
+    pipe = [{"$match":{"status":{"$in":["Active","Pending"]}}},
+            {"$group":{"_id":"$service_category","bookings":{"$sum":1},"revenue":{"$sum":"$amount"}}}]
+    rows = await db.bookings.aggregate(pipe).to_list(50)
+    total = sum(r["bookings"] for r in rows) or 1
+    out = []
+    for r in rows:
+        avg_staff_per_booking = 1.2 if "Nursing" in (r["_id"] or "") else 1.0
+        out.append({"service_category": r["_id"], "active_bookings": r["bookings"],
+                    "revenue": r["revenue"], "est_staff_needed": _math.ceil(r["bookings"]*avg_staff_per_booking),
+                    "pct_of_pipeline": round(r["bookings"]/total*100,1)})
+    return out
+
+# ────────────────────────────────────────────────────────────────────────────
+# INVENTORY + EQUIPMENT LENDING
+# ────────────────────────────────────────────────────────────────────────────
+@api.get("/inventory")
+async def list_inventory(category: Optional[str]=None, status: Optional[str]=None, user=Depends(current_user)):
+    q = {}
+    if category: q["category"] = category
+    if status: q["status"] = status
+    return await list_col("inventory_items", q, sort=("name", 1))
+
+@api.post("/inventory")
+async def add_inventory(d: Dict[str, Any], user=Depends(current_user)):
+    if user.get("role") not in ("admin","manager"): raise HTTPException(403, "Admin/Manager only")
+    iid = await next_id("inventory_items")
+    code = f"INV-{int(datetime.now().timestamp())}"
+    total_qty = int(d.get("total_qty", 1))
+    doc = {"id": iid, "item_code": code, "status":"Active", "total_qty": total_qty,
+           "available_qty": total_qty, "lent_qty": 0, "created_at": now_iso(),
+           **{k:v for k,v in d.items() if k not in ("id","item_code","available_qty","lent_qty")}}
+    await db.inventory_items.insert_one(doc)
+    await audit(user, "create", "inventory_item", iid, after={"name": d.get("name")})
+    return {"id": iid, "item_code": code, "message": "Inventory item added"}
+
+@api.put("/inventory/{iid}")
+async def upd_inventory(iid: int, d: Dict[str, Any], user=Depends(current_user)):
+    d.pop("id", None); d.pop("_id", None); d.pop("available_qty", None); d.pop("lent_qty", None)
+    await db.inventory_items.update_one({"id": iid}, {"$set": d})
+    return {"message":"Updated"}
+
+@api.get("/lendings")
+async def list_lendings(status: Optional[str]=None, patient_id: Optional[int]=None, user=Depends(current_user)):
+    q = {}
+    if status: q["status"] = status
+    if patient_id: q["patient_id"] = patient_id
+    rows = await list_col("lendings", q, sort=("id", -1))
+    pmap = {p["id"]: p for p in await list_col("patients")}
+    imap = {i["id"]: i for i in await list_col("inventory_items")}
+    for r in rows:
+        r["patient_name"] = pmap.get(r.get("patient_id"), {}).get("name")
+        item = imap.get(r.get("item_id"), {})
+        r["item_name"] = item.get("name"); r["item_code"] = item.get("item_code")
+    return rows
+
+@api.post("/lendings")
+async def add_lending(d: Dict[str, Any], user=Depends(current_user)):
+    item = await db.inventory_items.find_one({"id": d.get("item_id")})
+    if not item: raise HTTPException(404, "Item not found")
+    qty = int(d.get("qty", 1))
+    if item.get("available_qty", 0) < qty: raise HTTPException(400, "Insufficient stock")
+    lid = await next_id("lendings")
+    await db.lendings.insert_one({"id": lid, "item_id": d["item_id"], "patient_id": d.get("patient_id"),
+        "booking_id": d.get("booking_id"), "qty": qty, "issued_date": d.get("issued_date") or today(),
+        "expected_return": d.get("expected_return"), "deposit": d.get("deposit", 0),
+        "condition_at_issue": d.get("condition_at_issue","Good"), "issued_by": user.get("name"),
+        "status":"Issued", "created_at": now_iso()})
+    await db.inventory_items.update_one({"id": d["item_id"]}, {"$inc": {"available_qty": -qty, "lent_qty": qty}})
+    await audit(user, "create", "lending", lid, after={"item_id": d["item_id"], "patient_id": d.get("patient_id")})
+    return {"id": lid, "message":"Equipment lent"}
+
+@api.patch("/lendings/{lid}/return")
+async def return_lending(lid: int, body: Dict[str, Any], user=Depends(current_user)):
+    l = await db.lendings.find_one({"id": lid})
+    if not l or l.get("status") != "Issued": raise HTTPException(400, "Not an active lending")
+    cond = body.get("condition_at_return","Good")
+    damage = float(body.get("damage_charge", 0) or 0)
+    refund = max(0, float(l.get("deposit",0)) - damage)
+    await db.lendings.update_one({"id": lid}, {"$set": {
+        "actual_return": today(), "condition_at_return": cond, "damage_charge": damage,
+        "refund_amount": refund, "received_by": user.get("name"), "status":"Returned"}})
+    await db.inventory_items.update_one({"id": l["item_id"]}, {"$inc": {"available_qty": l["qty"], "lent_qty": -l["qty"]}})
+    return {"message":"Returned", "refund_amount": refund, "damage_charge": damage}
+
+# ────────────────────────────────────────────────────────────────────────────
+# INCIDENT WORKFLOW
+# ────────────────────────────────────────────────────────────────────────────
+@api.post("/incidents/{iid}/assign-investigator")
+async def assign_inv(iid: int, body: Dict[str, Any], user=Depends(current_user)):
+    if user.get("role") not in ("admin","manager","supervisor"): raise HTTPException(403, "Forbidden")
+    await db.incidents.update_one({"id": iid}, {"$set": {"investigator_id": body.get("investigator_id"),
+        "investigator_name": body.get("investigator_name"), "status":"Under Investigation",
+        "assigned_at": now_iso()}})
+    await audit(user, "assign", "incident", iid, after=body); return {"message":"Investigator assigned"}
+
+@api.post("/incidents/{iid}/findings")
+async def inc_findings(iid: int, body: Dict[str, Any], user=Depends(current_user)):
+    await db.incidents.update_one({"id": iid}, {"$set": {"findings": body.get("findings",""),
+        "root_cause": body.get("root_cause",""), "corrective_action": body.get("corrective_action",""),
+        "findings_at": now_iso()}})
+    return {"message":"Findings recorded"}
+
+@api.post("/incidents/{iid}/close")
+async def inc_close(iid: int, body: Dict[str, Any], user=Depends(current_user)):
+    if user.get("role") not in ("admin","manager"): raise HTTPException(403, "Admin/Manager only")
+    await db.incidents.update_one({"id": iid}, {"$set": {"status":"Closed",
+        "resolution": body.get("resolution",""), "closed_by": user.get("name"), "closed_at": now_iso()}})
+    await audit(user, "close", "incident", iid); return {"message":"Incident closed"}
+
+# ────────────────────────────────────────────────────────────────────────────
+# ADVANCED PAYROLL — Detailed breakdown
+# ────────────────────────────────────────────────────────────────────────────
+@api.get("/payroll/{staff_id}/details")
+async def payroll_details(staff_id: int, month: str = Query(...), user=Depends(current_user)):
+    s = await db.staff.find_one({"id": staff_id}, {"_id":0})
+    if not s: raise HTTPException(404, "Staff not found")
+    att = await db.attendance.find({"staff_id": staff_id, "date": {"$regex": f"^{month}"}}).to_list(200)
+    present = sum(1 for a in att if a.get("status")=="Present")
+    absent = sum(1 for a in att if a.get("status")=="Absent")
+    total_hrs = round(sum(a.get("hours_worked") or 0 for a in att), 2)
+    std_hours = present * 8
+    overtime_hrs = max(0, total_hrs - std_hours)
+    monthly = _parse_salary(s.get("salary"))
+    per_day = monthly / 26 if monthly else 0
+    per_hour = per_day / 8 if per_day else 0
+    basic = round(per_day * present)
+    hra = round(basic * 0.10)
+    conveyance = round(basic * 0.05)
+    overtime_pay = round(overtime_hrs * per_hour * 1.5)
+    gross = basic + hra + conveyance + overtime_pay
+    pf = round(basic * 0.12)
+    esi = round(gross * 0.0075) if gross < 21000 else 0
+    tds = 0  # No TDS for low-income staff
+    pt = 200 if gross > 15000 else 0  # Professional tax
+    deductions = pf + esi + tds + pt
+    leave_deduction = round(per_day * absent)
+    net_pay = gross - deductions - leave_deduction
+    return {
+        "staff": {"id": s["id"], "code": s.get("code"), "name": s.get("name"),
+                  "role": s.get("role"), "vendor": s.get("vendor"),
+                  "employment_type": s.get("employment_type")},
+        "month": month,
+        "attendance": {"days_present": present, "days_absent": absent,
+                       "total_hours": total_hrs, "std_hours": std_hours, "overtime_hrs": overtime_hrs},
+        "earnings": {"basic": basic, "hra": hra, "conveyance": conveyance,
+                     "overtime_pay": overtime_pay, "gross": gross},
+        "deductions": {"pf": pf, "esi": esi, "professional_tax": pt, "tds": tds,
+                       "leave_deduction": leave_deduction, "total": deductions + leave_deduction},
+        "net_pay": net_pay,
+    }
+
+# ────────────────────────────────────────────────────────────────────────────
+# PATIENT APP — Self-service endpoints
+# ────────────────────────────────────────────────────────────────────────────
+async def patient_only(user=Depends(current_user)):
+    if user.get("role") != "patient": raise HTTPException(403, "Patient app only")
+    return user
+
+@api.get("/patient-app/me")
+async def pa_me(user=Depends(patient_only)):
+    p = await db.patients.find_one({"id": user.get("id")}, {"_id":0})
+    if not p: raise HTTPException(404, "Patient not found")
+    return p
+
+@api.get("/patient-app/my-bookings")
+async def pa_bookings(user=Depends(patient_only)):
+    rows = await db.bookings.find({"patient_id": user.get("id")}, {"_id":0}).sort("id", -1).to_list(100)
+    smap = {s["id"]: s for s in await list_col("staff")}
+    for r in rows:
+        s = smap.get(r.get("staff_id"), {})
+        r["staff_name"] = s.get("name"); r["staff_mobile"] = s.get("mobile"); r["staff_rating"] = s.get("rating")
+    return rows
+
+@api.get("/patient-app/my-bills")
+async def pa_bills(user=Depends(patient_only)):
+    return await db.bills.find({"patient_id": user.get("id")}, {"_id":0}).sort("id", -1).to_list(100)
+
+@api.get("/patient-app/my-charts")
+async def pa_charts(user=Depends(patient_only)):
+    rows = await db.medical_charts.find({"patient_id": user.get("id")}, {"_id":0}).sort("visit_date", -1).limit(60).to_list(60)
+    for r in rows:
+        try: r["data"] = json.loads(r.get("chart_data") or "{}")
+        except: r["data"] = {}
+    return rows
+
+@api.post("/patient-app/request-service")
+async def pa_request(d: Dict[str, Any], user=Depends(patient_only)):
+    p = await db.patients.find_one({"id": user.get("id")})
+    lid = await next_id("leads")
+    await db.leads.insert_one({"id": lid, "caller_name": p.get("name"), "caller_mobile": p.get("mobile"),
+        "relation":"Self", "source":"Patient App", "patient_name": p.get("name"),
+        "patient_age": p.get("age"), "patient_gender": p.get("gender"), "patient_address": p.get("address"),
+        "diagnosis": p.get("diagnosis"), "service_needed": d.get("service_needed"),
+        "urgency": d.get("urgency","Planned"), "status":"New", "notes": d.get("notes",""),
+        "created_at": now_iso()})
+    await db.notifications.insert_one({"id": await next_id("notifications"), "channel":"in-app",
+        "title":"New Patient App Request", "message": f"{p.get('name')} requested {d.get('service_needed')}",
+        "recipient_type":"admin", "status":"Pending", "created_at": now_iso()})
+    return {"id": lid, "message":"Service request submitted"}
+
+@api.post("/patient-app/feedback")
+async def pa_feedback(d: Dict[str, Any], user=Depends(patient_only)):
+    fid = await next_id("feedback")
+    await db.feedback.insert_one({"id": fid, "patient_id": user.get("id"), "staff_id": d.get("staff_id"),
+        "booking_id": d.get("booking_id"), "service_rating": d.get("service_rating"),
+        "staff_rating": d.get("staff_rating"), "comments": d.get("comments",""),
+        "source":"Patient App", "created_at": now_iso()})
+    if d.get("staff_id") and d.get("staff_rating"):
+        await db.staff_ratings.insert_one({"id": await next_id("staff_ratings"),
+            "staff_id": d["staff_id"], "patient_id": user.get("id"),
+            "source":"Patient Feedback", "score": d["staff_rating"],
+            "comment": d.get("comments",""), "rated_at": now_iso()})
+        await recalc_weighted_rating(d["staff_id"])
+    return {"id": fid, "message":"Thank you for your feedback"}
+
+@api.post("/patient-app/consent")
+async def pa_consent(d: Dict[str, Any], user=Depends(patient_only)):
+    cid = await next_id("consents")
+    await db.consents.insert_one({"id": cid, "patient_id": user.get("id"),
+        "consent_type": d.get("consent_type"), "signed_text": d.get("signed_text"),
+        "signature_method": d.get("signature_method","Digital Click"),
+        "status":"Signed", "signed_at": now_iso(), "created_at": now_iso()})
+    return {"id": cid, "message":"Consent recorded"}
+
+# ────────────────────────────────────────────────────────────────────────────
+# STAFF APP — Mobile endpoints
+# ────────────────────────────────────────────────────────────────────────────
+async def staff_only(user=Depends(current_user)):
+    if user.get("role") not in ("staff","admin"): raise HTTPException(403, "Staff app only")
+    return user
+
+@api.get("/staff-app/me")
+async def sa_me(user=Depends(staff_only)):
+    s = await db.staff.find_one({"id": user.get("id")}, {"_id":0})
+    if not s: raise HTTPException(404, "Staff not found")
+    docs = await list_col("staff_documents", {"staff_id": user.get("id")})
+    comp = compute_compliance(s, docs)
+    return {**s, "compliance": comp}
+
+@api.get("/staff-app/my-roster")
+async def sa_roster(frm: Optional[str]=Query(None, alias="from"), to: Optional[str]=None, user=Depends(staff_only)):
+    q = {"staff_id": user.get("id")}
+    if frm: q["date"] = {"$gte": frm}
+    if to: q.setdefault("date", {})["$lte"] = to
+    rows = await db.roster.find(q, {"_id":0}).sort("date", 1).to_list(200)
+    pmap = {p["id"]: p for p in await list_col("patients")}
+    for r in rows:
+        p = pmap.get(r.get("patient_id"), {})
+        r["patient_name"] = p.get("name"); r["patient_mobile"] = p.get("mobile")
+        r["patient_address"] = p.get("address"); r["diagnosis"] = p.get("diagnosis")
+    return rows
+
+@api.get("/staff-app/my-payslips")
+async def sa_payslips(user=Depends(staff_only)):
+    return await db.payroll_records.find({"staff_id": user.get("id")}, {"_id":0}).sort("month", -1).to_list(24)
+
+@api.get("/staff-app/my-trainings")
+async def sa_trainings(user=Depends(staff_only)):
+    return await db.training.find({"staff_id": user.get("id")}, {"_id":0}).sort("id", -1).to_list(50)
+
+@api.post("/staff-app/raise-incident")
+async def sa_incident(d: Dict[str, Any], user=Depends(staff_only)):
+    iid = await next_id("incidents")
+    await db.incidents.insert_one({"id": iid, "staff_id": user.get("id"),
+        "patient_id": d.get("patient_id"), "incident_type": d.get("incident_type"),
+        "severity": d.get("severity","Medium"), "description": d.get("description",""),
+        "status":"Open", "reported_at": now_iso(), "reporter_name": user.get("name")})
+    return {"id": iid, "message":"Incident reported"}
+
+@api.post("/staff-app/submit-chart")
+async def sa_chart(d: Dict[str, Any], user=Depends(staff_only)):
+    cid = await next_id("medical_charts")
+    data = d.get("chart_data")
+    if isinstance(data, dict): data = json.dumps(data)
+    await db.medical_charts.insert_one({"id": cid, "booking_id": d.get("booking_id"),
+        "patient_id": d.get("patient_id"), "staff_id": user.get("id"),
+        "chart_type": d.get("chart_type"), "chart_data": data,
+        "visit_date": d.get("visit_date") or today(), "created_at": now_iso()})
+    return {"id": cid, "message":"Chart submitted"}
+
+# ── Run additional seeds ───────────────────────────────────────────────────
+@app.on_event("startup")
+async def _seed_phase2():
+    await _seed_templates()
+
 # ── Mount static & API ─────────────────────────────────────────────────────
 app.include_router(api)
 app.mount("/api/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
