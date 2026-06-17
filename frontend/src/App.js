@@ -3,6 +3,11 @@ import {
   BarChart, Bar, LineChart, Line, PieChart, Pie, Cell, AreaChart, Area,
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer
 } from "recharts";
+import {
+  UserMgmtModule, AuditLogsModule, InventoryLendingModule,
+  NotifTemplatesModule, AdvancedAnalyticsModule, AutoAllocateModule,
+  AdvancedPayslipModule, IncidentWorkflowModule
+} from "./Phase2";
 
 const API = (process.env.REACT_APP_BACKEND_URL || "") + "/api";
 
@@ -628,7 +633,17 @@ export default function App() {
     ]},
     { group:"Insights", items:[
       { id:"analytics", icon:"📈", label:"Analytics" },
+      { id:"analytics_plus", icon:"🎯", label:"NPS & Forecast" },
       { id:"reports",   icon:"📄", label:"Reports" },
+    ]},
+    { group:"Admin", items:[
+      { id:"users",         icon:"👤", label:"User Management" },
+      { id:"audit_logs",    icon:"🛡️", label:"Audit Logs" },
+      { id:"inventory",     icon:"📦", label:"Inventory & Lending" },
+      { id:"notif_templates", icon:"📨", label:"Notif Templates" },
+      { id:"auto_allocate", icon:"🤖", label:"Auto-Allocate" },
+      { id:"adv_payslip",   icon:"💳", label:"Advanced Payslip" },
+      { id:"incidents_v2",  icon:"🚨", label:"Incident Workflow" },
     ]},
   ];
 
@@ -839,6 +854,14 @@ export default function App() {
           {page==="notifications_engine" && <NotificationEngineModule auth={auth} />}
           {page==="patient_app"   && <PatientAppModule auth={auth} />}
           {page==="staff_app"     && <StaffAppModule auth={auth} />}
+          {page==="users"          && <UserMgmtModule auth={auth} user={user} />}
+          {page==="audit_logs"     && <AuditLogsModule auth={auth} />}
+          {page==="inventory"      && <InventoryLendingModule auth={auth} user={user} />}
+          {page==="notif_templates"&& <NotifTemplatesModule auth={auth} />}
+          {page==="analytics_plus" && <AdvancedAnalyticsModule auth={auth} />}
+          {page==="auto_allocate"  && <AutoAllocateModule auth={auth} />}
+          {page==="adv_payslip"    && <AdvancedPayslipModule auth={auth} />}
+          {page==="incidents_v2"   && <IncidentWorkflowModule auth={auth} user={user} />}
         </div>
       </main>
     </div>
