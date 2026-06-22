@@ -36,13 +36,26 @@ declared before `/api/wallet/refund-requests`, so FastAPI tried to int-parse the
 - ✅ Route ordering fixed — `/wallet/refund-requests` (GET) and
   `/wallet/refund-requests/{rid}/status` (PATCH) moved above `/wallet/{pid}` to avoid
   FastAPI route shadowing.
+- ✅ **Wallet self-heal/recovery (iter-3)** — addresses the lost `wallet_transactions`
+  ledger from the Render migration:
+  - `reconcile_wallet_credits_from_bookings()` scans every Stopped/Cancelled/Converted
+    booking and recreates the missing CREDIT transactions. Idempotent on
+    `(patient_id, reference_id, CREDIT/REFUND/ADJUSTMENT)`.
+  - `recompute_wallet_balances_from_transactions()` rebuilds
+    `patient_wallets.{current_balance,total_credited,total_debited,total_refunded}`
+    strictly from the `wallet_transactions` ledger.
+  - Both run on every startup AND can be triggered on demand by admin via
+    `POST /api/wallet/admin/recalculate` (returns reconciliation + recompute payloads).
 
 ## Test coverage
-- `/app/backend/tests/test_wallet_module.py` — 21 pytest tests, **21/21 PASSED**.
+- `/app/backend/tests/test_wallet_module.py` — **30 pytest tests, 30/30 PASSED**.
+- Iteration history: iter-1 (15 tests, 14/15 — found route shadowing) → iter-2
+  (21/21 after route reorder) → iter-3 (30/30 with self-heal coverage).
 - Covers: login, patient seed, `/api/wallets` list+search+min_balance, `/api/wallet/{pid}`,
   credit/debit/adjust, transactions, dashboard-stats, new-patient auto-wallet, refund
   workflow Pending→Approved→Completed (with REFUND wallet transaction), role-based 403s,
-  migration script idempotency, route-shadowing regression guard.
+  migration script idempotency, route-shadowing regression guard, full self-heal recovery
+  (stop booking → wipe ledger → recalculate → balance recovered) + idempotency.
 
 ## Files modified
 - `backend/server.py` — `list_wallets()`, `create_patient()`, `on_start()` +
