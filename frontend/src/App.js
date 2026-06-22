@@ -619,6 +619,33 @@ export default function App() {
 
   function logout(){ setToken(""); setUser(null); localStorage.removeItem("ro_token"); }
 
+  // ── Change Password modal state ──
+  const [showPwd, setShowPwd] = useState(false);
+  const [pwdForm, setPwdForm] = useState({ current:"", next:"", confirm:"" });
+  const [pwdBusy, setPwdBusy] = useState(false);
+  const [pwdErr, setPwdErr] = useState("");
+  async function submitChangePassword(){
+    setPwdErr("");
+    if (!pwdForm.current || !pwdForm.next || !pwdForm.confirm) { setPwdErr("All fields are required"); return; }
+    if (pwdForm.next !== pwdForm.confirm) { setPwdErr("New password and confirmation don't match"); return; }
+    if (pwdForm.next.length < 8) { setPwdErr("New password must be at least 8 characters"); return; }
+    setPwdBusy(true);
+    try {
+      const r = await fetch(`${API}/change-password`, {
+        method:"POST",
+        headers:{ "Content-Type":"application/json", Authorization:`Bearer ${token}` },
+        body: JSON.stringify({ current_password: pwdForm.current, new_password: pwdForm.next }),
+      });
+      const d = await r.json().catch(()=>({}));
+      if (!r.ok) { setPwdErr(d.detail || d.message || "Failed to change password"); return; }
+      alert("Password changed successfully. Please sign in again with your new password.");
+      setShowPwd(false);
+      setPwdForm({ current:"", next:"", confirm:"" });
+      logout();
+    } catch(e) { setPwdErr("Network error"); }
+    finally { setPwdBusy(false); }
+  }
+
   if(!token) return <LoginPage setToken={setToken} setUser={setUser} />;
 
   const navGroups = [
@@ -767,6 +794,11 @@ export default function App() {
                   <div style={{ color:"#C4B5FD", fontSize:11, fontWeight:700, letterSpacing:"0.05em" }}>{user?.role?.toUpperCase()}</div>
                 </div>
               </div>
+              <button onClick={()=>setShowPwd(true)} data-testid="change-password-btn" style={{ width:"100%", background:"rgba(99,102,241,0.15)", color:"#C7D2FE", border:"1px solid rgba(99,102,241,0.30)", borderRadius:10, padding:"9px", cursor:"pointer", fontSize:12, fontWeight:800, transition:"all 0.15s", letterSpacing:"0.02em", marginBottom:8 }}
+                onMouseEnter={e=>{ e.currentTarget.style.background="rgba(99,102,241,0.28)"; }}
+                onMouseLeave={e=>{ e.currentTarget.style.background="rgba(99,102,241,0.15)"; }}>
+                🔑 Change Password
+              </button>
               <button onClick={logout} style={{ width:"100%", background:"rgba(239,68,68,0.15)", color:"#FCA5A5", border:"1px solid rgba(239,68,68,0.25)", borderRadius:10, padding:"9px", cursor:"pointer", fontSize:13, fontWeight:800, transition:"all 0.15s", letterSpacing:"0.02em" }}
                 onMouseEnter={e=>{ e.currentTarget.style.background="rgba(239,68,68,0.28)"; }}
                 onMouseLeave={e=>{ e.currentTarget.style.background="rgba(239,68,68,0.15)"; }}>
@@ -774,12 +806,51 @@ export default function App() {
               </button>
             </div>
           ) : (
-            <div style={{ display:"flex", justifyContent:"center" }}>
+            <div style={{ display:"flex", flexDirection:"column", gap:8, alignItems:"center" }}>
+              <button onClick={()=>setShowPwd(true)} title="Change Password" data-testid="change-password-btn-collapsed" style={{ background:"rgba(99,102,241,0.12)", color:"#C7D2FE", border:"none", borderRadius:8, width:36, height:36, cursor:"pointer", fontSize:14 }}>🔑</button>
               <button onClick={logout} title="Sign Out" style={{ background:"rgba(239,68,68,0.12)", color:"#FCA5A5", border:"none", borderRadius:8, width:36, height:36, cursor:"pointer", fontSize:16 }}>↪</button>
             </div>
           )}
         </div>
       </aside>
+
+      {/* Change Password Modal */}
+      {showPwd && (
+        <div data-testid="change-password-modal" onClick={()=>!pwdBusy && setShowPwd(false)} style={{ position:"fixed", inset:0, background:"rgba(15,23,42,0.55)", backdropFilter:"blur(6px)", zIndex:1000, display:"flex", alignItems:"center", justifyContent:"center", padding:20 }}>
+          <div onClick={e=>e.stopPropagation()} style={{ background:"#fff", borderRadius:18, padding:"28px 32px", width:"100%", maxWidth:420, boxShadow:"0 30px 80px rgba(15,23,42,0.30)" }}>
+            <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:6 }}>
+              <h3 style={{ margin:0, fontSize:20, fontWeight:900, color:C.text, letterSpacing:"-0.01em" }}>🔑 Change Password</h3>
+              <button onClick={()=>!pwdBusy && setShowPwd(false)} style={{ background:"none", border:"none", color:C.muted, fontSize:22, cursor:"pointer" }}>×</button>
+            </div>
+            <p style={{ fontSize:12, color:C.muted, marginTop:0, marginBottom:18 }}>You'll be signed out after the change.</p>
+
+            {["Current password","New password","Confirm new password"].map((lbl,i)=>{
+              const key = ["current","next","confirm"][i];
+              return (
+                <div key={key} style={{ marginBottom:14 }}>
+                  <label style={{ display:"block", fontSize:11, color:C.muted, fontWeight:800, letterSpacing:"0.06em", textTransform:"uppercase", marginBottom:6 }}>{lbl}</label>
+                  <input type="password" autoComplete="off"
+                    data-testid={`pwd-${key}`}
+                    value={pwdForm[key]}
+                    onChange={e=>setPwdForm({...pwdForm,[key]:e.target.value})}
+                    disabled={pwdBusy}
+                    style={{ width:"100%", padding:"11px 14px", border:`1px solid ${C.border}`, borderRadius:10, fontSize:14, outline:"none", background: pwdBusy?"#F8FAFC":"#fff", color:C.text, boxSizing:"border-box" }}/>
+                </div>
+              );
+            })}
+
+            {pwdErr && (
+              <div data-testid="change-password-error" style={{ background:"#FEF2F2", color:"#B91C1C", border:"1px solid #FECACA", padding:"8px 12px", borderRadius:8, fontSize:12, fontWeight:700, marginBottom:12 }}>{pwdErr}</div>
+            )}
+            <div style={{ fontSize:11, color:C.muted, marginBottom:16 }}>Min 8 characters; must include letters and a number/symbol.</div>
+
+            <div style={{ display:"flex", gap:10, justifyContent:"flex-end" }}>
+              <button onClick={()=>!pwdBusy && setShowPwd(false)} disabled={pwdBusy} style={{ padding:"10px 18px", borderRadius:10, border:`1px solid ${C.border}`, background:"#fff", color:C.text, fontWeight:700, fontSize:13, cursor: pwdBusy?"not-allowed":"pointer" }}>Cancel</button>
+              <button onClick={submitChangePassword} disabled={pwdBusy} data-testid="change-password-submit" style={{ padding:"10px 22px", borderRadius:10, border:"none", background: pwdBusy?"#94A3B8":G.purple, color:"#fff", fontWeight:800, fontSize:13, cursor: pwdBusy?"not-allowed":"pointer", boxShadow:"0 6px 20px rgba(139,92,246,0.35)" }}>{pwdBusy?"Saving…":"Update Password"}</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── MAIN ── */}
       <main style={{ flex:1, overflowY:"auto", display:"flex", flexDirection:"column", minWidth:0 }}>
@@ -989,9 +1060,6 @@ function LoginPage({ setToken, setUser }) {
             </span>
           ) : "Sign In →"}
         </button>
-        <p style={{ textAlign:"center", fontSize:11, color:"#C4B5FD", marginTop:16, marginBottom:0 }}>
-          Default: <strong style={{ color:C.mutedLight }}>admin</strong> / <strong style={{ color:C.mutedLight }}>Admin@1234</strong>
-        </p>
       </div>
     </div>
   );

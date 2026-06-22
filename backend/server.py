@@ -646,6 +646,37 @@ async def login(body: Dict[str, Any]):
     token = make_token({"id": u["id"], "role": u["role"], "name": u["name"]})
     return {"success": True, "role": u["role"], "name": u["name"], "token": token}
 
+
+@api.post("/change-password")
+async def change_password(body: Dict[str, Any], user=Depends(current_user)):
+    """Authenticated user changes their own password.
+    Body: {"current_password": "...", "new_password": "..."}
+    Rules: new must be >=8 chars and contain at least one letter and one digit
+    or symbol. Current password is verified before applying the change."""
+    cur = (body.get("current_password") or "").strip()
+    new = (body.get("new_password") or "").strip()
+    if not cur or not new:
+        raise HTTPException(400, "current_password and new_password are required")
+    if len(new) < 8:
+        raise HTTPException(400, "New password must be at least 8 characters")
+    if new == cur:
+        raise HTTPException(400, "New password must be different from current password")
+    has_letter = any(c.isalpha() for c in new)
+    has_other  = any((not c.isalpha()) for c in new)
+    if not (has_letter and has_other):
+        raise HTTPException(400, "New password must contain both letters and a number/symbol")
+    u = await db.users.find_one({"id": user.get("id")})
+    if not u: raise HTTPException(404, "User not found")
+    if not pwd_ctx.verify(cur, u["password"]):
+        raise HTTPException(401, "Current password is incorrect")
+    new_hash = pwd_ctx.hash(new)
+    await db.users.update_one({"id": u["id"]}, {"$set": {
+        "password": new_hash,
+        "password_updated_at": now_iso(),
+    }})
+    await audit(user, "change_password", "user", u["id"], None, None)
+    return {"message": "Password changed successfully"}
+
 # ────────────────────────────────────────────────────────────────────────────
 # DASHBOARD STATS
 # ────────────────────────────────────────────────────────────────────────────
