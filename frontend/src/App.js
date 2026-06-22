@@ -5200,6 +5200,26 @@ function WalletModule({ auth, user }) {
     alert(d.message || "Updated"); loadRefunds(); loadStats();
   }
 
+  async function recalculateWallets() {
+    if (saving) return; setSaving(true);
+    try {
+      const r = await auth(`/wallet/admin/recalculate`, { method:"POST" });
+      const d = await r.json();
+      if (!r.ok) { alert(d.message || d.detail || "Failed"); return; }
+      const recon = d.reconciliation || {};
+      const recomp = d.balance_recompute || {};
+      alert(
+        `${d.message || "Done"}\n\n` +
+        `New credits recovered : ${recon.created || 0}\n` +
+        `Already in sync       : ${recon.skipped_already_credited || 0}\n` +
+        `Bookings scanned      : ${recon.bookings_scanned || 0}\n` +
+        `Patient wallets synced: ${recomp.recomputed || 0}`
+      );
+      loadStats(); loadWallets();
+      if (selectedPid) loadPatientWallet(selectedPid);
+    } catch(e){ alert("Network error"); } finally { setSaving(false); }
+  }
+
   // ───────── Render ─────────
   const tabs = [
     { id:"overview", label:"Wallet Overview" },
@@ -5209,6 +5229,25 @@ function WalletModule({ auth, user }) {
 
   return (
     <div>
+      {/* Admin-only action bar */}
+      {isAdmin && (
+        <div style={{ display:"flex", justifyContent:"flex-end", marginBottom:10 }}>
+          <button
+            data-testid="wallet-recalculate-btn"
+            onClick={recalculateWallets}
+            disabled={saving}
+            style={{
+              padding:"8px 14px", borderRadius:8, border:`1px solid ${C.border}`,
+              background:"#F5F3FF", color:C.accent, fontWeight:700, fontSize:12,
+              cursor: saving?"not-allowed":"pointer", letterSpacing:"0.02em",
+            }}
+            title="Re-derive missing wallet credits from booking history and recompute balances from the transaction ledger. Safe to run anytime."
+          >
+            {saving ? "Recalculating…" : "🔄 Recalculate Wallets"}
+          </button>
+        </div>
+      )}
+
       {/* Stat cards */}
       <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:12, marginBottom:16 }}>
         <StatCard icon="💼" label="Total Wallet Balance" value={`₹${(stats.totalWalletBalance||0).toLocaleString("en-IN")}`} sub={`${stats.patientsWithBalance||0} patients`} gradient={G.teal} />
@@ -5239,7 +5278,7 @@ function WalletModule({ auth, user }) {
             </div>
             <div style={{ maxHeight:520, overflowY:"auto" }}>
               {wallets.length===0 ? (
-                <div style={{ padding:30, textAlign:"center", color:C.muted, fontSize:13 }}>No wallets with balance yet.</div>
+                <div style={{ padding:30, textAlign:"center", color:C.muted, fontSize:13 }}>No patients match your search.</div>
               ) : wallets.map(w=>(
                 <div key={w.id} onClick={()=>setSelectedPid(w.patient_id)} style={{
                   padding:"12px 14px", cursor:"pointer",
