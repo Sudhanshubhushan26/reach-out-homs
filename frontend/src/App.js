@@ -5250,7 +5250,7 @@ function WalletModule({ auth, user }) {
 
       {/* Stat cards */}
       <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:12, marginBottom:16 }}>
-        <StatCard icon="💼" label="Total Wallet Balance" value={`₹${(stats.totalWalletBalance||0).toLocaleString("en-IN")}`} sub={`${stats.patientsWithBalance||0} patients`} gradient={G.teal} />
+        <StatCard icon="💼" label="Total Wallet Balance" value={`₹${(stats.totalWalletBalance||0).toLocaleString("en-IN")}`} sub={`${stats.patientsWithBalance||0} of ${wallets.length||0} patients with balance`} gradient={G.teal} />
         <StatCard icon="↩️" label="Pending Refunds" value={stats.pendingRefundRequests||0} sub={`${stats.approvedRefundRequests||0} approved`} gradient={G.amber} />
         <StatCard icon="📈" label="Credits This Month" value={`₹${(stats.walletCreditsThisMonth||0).toLocaleString("en-IN")}`} gradient={G.green} />
         <StatCard icon="📉" label="Debits This Month" value={`₹${(stats.walletDebitsThisMonth||0).toLocaleString("en-IN")}`} gradient={G.red} />
@@ -5303,7 +5303,13 @@ function WalletModule({ auth, user }) {
           {/* Selected wallet detail */}
           <Card>
             {!selectedPid ? (
-              <div style={{ padding:40, textAlign:"center", color:C.muted }}>← Select a patient to view wallet details</div>
+              <div style={{ padding:40, textAlign:"center", color:C.muted }}>
+                <div style={{ fontSize:42, marginBottom:8 }}>💼</div>
+                <div style={{ fontWeight:700, color:C.text, marginBottom:4 }}>Select a patient to view wallet details</div>
+                <div style={{ fontSize:12, color:C.muted, maxWidth:340, margin:"6px auto" }}>
+                  Balances are ₹0 until credits are added. Click a patient on the left, then use <b>⚙️ Manual Adjustment</b> to credit their wallet, or stop a booking to auto-credit the unconsumed amount.
+                </div>
+              </div>
             ) : (
               <div>
                 <div style={{ padding:"14px 16px", borderBottom:`1px solid ${C.border}`, display:"flex", justifyContent:"space-between", alignItems:"center" }}>

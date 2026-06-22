@@ -2007,6 +2007,56 @@ async def reset_database(body: Optional[Dict[str, Any]] = None, user=Depends(cur
 # ────────────────────────────────────────────────────────────────────────────
 # WALLET — patient prepaid balance, transactions, refund requests, reports
 # ────────────────────────────────────────────────────────────────────────────
+@api.post("/wallet/admin/bulk-credit")
+async def admin_bulk_credit(body: Dict[str, Any], user=Depends(current_user)):
+    """Admin-only: credit multiple wallets at once.
+
+    Body: {"entries": [{"patient_id": 1, "amount": 5000, "remarks": "..."}], "remarks": "default"}
+    or matching by reg_number: [{"reg_number": "RO-PAT-001", "amount": 5000}]
+    Each entry creates an ADJUSTMENT/CREDIT wallet_transaction and updates balance.
+    Returns a per-row report. Idempotency: each row gets a unique tx, so calling twice
+    will credit twice — use carefully.
+    """
+    if not is_super_admin(user):
+        raise HTTPException(403, "Only Super Admin can bulk-credit wallets")
+    entries = body.get("entries") or []
+    if not isinstance(entries, list) or not entries:
+        raise HTTPException(400, "entries must be a non-empty list")
+    default_remarks = body.get("remarks") or "Bulk credit (admin)"
+    results = []
+    pmap_by_reg = None
+    for i, e in enumerate(entries):
+        try:
+            pid = e.get("patient_id")
+            if not pid and e.get("reg_number"):
+                if pmap_by_reg is None:
+                    pmap_by_reg = {p["reg_number"]: p["id"] for p in await list_col("patients") if p.get("reg_number")}
+                pid = pmap_by_reg.get(e["reg_number"])
+            amount = float(e.get("amount") or 0)
+            if not pid or amount <= 0:
+                results.append({"row": i, "patient_id": pid, "status": "skipped",
+                                "reason": "missing patient_id/reg_number or non-positive amount"})
+                continue
+            await _ensure_wallet(int(pid))
+            tx = await _wallet_tx(
+                int(pid), "ADJUSTMENT", amount,
+                "Bulk Credit", None,
+                e.get("remarks") or default_remarks,
+                user,
+            )
+            results.append({"row": i, "patient_id": pid, "status": "credited",
+                            "amount": amount, "tx_id": tx["id"],
+                            "balance_after": tx["balance_after"]})
+        except Exception as ex:
+            results.append({"row": i, "patient_id": e.get("patient_id"),
+                            "status": "error", "reason": str(ex)})
+    await audit(user, "wallet_bulk_credit", "wallet", None, None,
+                {"count": len(entries), "credited": sum(1 for r in results if r["status"]=="credited")})
+    return {
+        "message": f"Bulk credit complete — {sum(1 for r in results if r['status']=='credited')} of {len(entries)} credited",
+        "results": results,
+    }
+
 @api.post("/wallet/admin/recalculate")
 async def admin_recalculate_wallets(user=Depends(current_user)):
     """Admin-only: rebuild wallet balances from the transaction ledger and
