@@ -1403,6 +1403,9 @@ function StaffModule({ auth, user }) {
           <option value="">All Vendors</option>
           {vendors.map(v=><option key={v.id}>{v.name}</option>)}
         </select>
+        {(search||filterRole||filterDuty||filterVendor) && (
+          <button onClick={()=>{ setSearch(""); setFilterRole(""); setFilterDuty(""); setFilterVendor(""); }} data-testid="staff-clear-filters" style={{ background:"#FEF2F2", color:"#B91C1C", border:"1px solid #FECACA", padding:"6px 12px", borderRadius:8, cursor:"pointer", fontSize:12, fontWeight:700 }}>✕ Clear</button>
+        )}
         <div style={{ marginLeft:"auto" }}><Btn onClick={openAdd}>+ Add Staff</Btn></div>
       </FilterBar>
 
@@ -1889,6 +1892,9 @@ function PatientModule({ auth, user }) {
           <option value="">All Status</option>
           {["Active","Inactive","Closed"].map(s=><option key={s}>{s}</option>)}
         </select>
+        {(search||filterLoc||filterStatus) && (
+          <button onClick={()=>{ setSearch(""); setFilterLoc(""); setFilterStatus(""); }} data-testid="patients-clear-filters" style={{ background:"#FEF2F2", color:"#B91C1C", border:"1px solid #FECACA", padding:"6px 12px", borderRadius:8, cursor:"pointer", fontSize:12, fontWeight:700 }}>✕ Clear</button>
+        )}
         <div style={{ marginLeft:"auto" }}><Btn onClick={openAdd}>+ Register Patient</Btn></div>
       </FilterBar>
 
@@ -2100,6 +2106,8 @@ function BookingsModule({ auth, user }) {
   const [services, setServices] = useState([]);
   const [search, setSearch] = useState("");
   const [filterStatus, setFilterStatus] = useState("");
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
   const [showForm, setShowForm] = useState(false);
   const [showReassign, setShowReassign] = useState(false);
   const [form, setForm] = useState({});
@@ -2119,13 +2127,18 @@ function BookingsModule({ auth, user }) {
   const canEdit = role === "admin" || role === "manager";
 
   function load() {
-    const q = new URLSearchParams({ ...(search&&{search}), ...(filterStatus&&{status:filterStatus}) });
+    const q = new URLSearchParams({
+      ...(search&&{search}),
+      ...(filterStatus&&{status:filterStatus}),
+      ...(fromDate&&{from:fromDate}),
+      ...(toDate&&{to:toDate}),
+    });
     auth(`/bookings?${q}`).then(r=>r.json()).then(d=>Array.isArray(d)&&setBookings(d)).catch(()=>{});
     auth("/patients").then(r=>r.json()).then(d=>Array.isArray(d)&&setPatients(d)).catch(()=>{});
     auth("/staff?status=Active").then(r=>r.json()).then(d=>Array.isArray(d)&&setStaff(d)).catch(()=>{});
     auth("/services").then(r=>r.json()).then(d=>Array.isArray(d)&&setServices(d)).catch(()=>{});
   }
-  useEffect(()=>{ load(); },[search,filterStatus]);
+  useEffect(()=>{ load(); },[search,filterStatus,fromDate,toDate]);
 
   // Fetch wallet balance for selected patient (used in booking form)
   useEffect(()=>{
@@ -2213,10 +2226,15 @@ function BookingsModule({ auth, user }) {
 
       <FilterBar>
         <SearchBar value={search} onChange={setSearch} placeholder="Search patient or booking ID…" />
-        <select style={{...inp,minWidth:140}} value={filterStatus} onChange={e=>setFilterStatus(e.target.value)}>
+        <select style={{...inp,minWidth:140}} value={filterStatus} onChange={e=>setFilterStatus(e.target.value)} data-testid="bookings-filter-status">
           <option value="">All Status</option>
           {statuses.map(s=><option key={s}>{s}</option>)}
         </select>
+        <input type="date" data-testid="bookings-from-date" value={fromDate} onChange={e=>setFromDate(e.target.value)} title="Start date from" style={{...inp,minWidth:140}} />
+        <input type="date" data-testid="bookings-to-date"   value={toDate}   onChange={e=>setToDate(e.target.value)}   title="Start date to"   style={{...inp,minWidth:140}} />
+        {(search||filterStatus||fromDate||toDate) && (
+          <button onClick={()=>{ setSearch(""); setFilterStatus(""); setFromDate(""); setToDate(""); }} data-testid="bookings-clear-filters" style={{ background:"#FEF2F2", color:"#B91C1C", border:"1px solid #FECACA", padding:"6px 12px", borderRadius:8, cursor:"pointer", fontSize:12, fontWeight:700 }}>✕ Clear</button>
+        )}
         <div style={{ marginLeft:"auto" }}><Btn onClick={()=>{ setForm({ status:"Pending",payment_status:"Pending" }); setSelected(null); setShowForm(true); }}>+ New Booking</Btn></div>
       </FilterBar>
 
@@ -2409,7 +2427,12 @@ function ServicesCatalogModule({ auth, user }) {
   }
 
   const categories = [...new Set(services.map(s=>s.category))].sort();
-  const filtered = filter ? services.filter(s=>s.category===filter) : services;
+  const [search, setSearch] = useState("");
+  const sl = search.trim().toLowerCase();
+  const filtered = services.filter(s =>
+    (!filter || s.category === filter) &&
+    (!sl || (s.name||"").toLowerCase().includes(sl) || (s.category||"").toLowerCase().includes(sl) || (s.description||"").toLowerCase().includes(sl))
+  );
   const byCat = {};
   filtered.forEach(s=>{ (byCat[s.category]=byCat[s.category]||[]).push(s); });
 
@@ -2422,10 +2445,14 @@ function ServicesCatalogModule({ auth, user }) {
         <StatCard icon="💰" label="Avg. Std Rate" value={`₹${Math.round(services.reduce((a,s)=>a+(parseFloat(s.standard_rate)||0),0)/(services.length||1)).toLocaleString("en-IN")}`} gradient={G.amber} />
       </div>
       <FilterBar>
-        <select style={{...inp,minWidth:240}} value={filter} onChange={e=>setFilter(e.target.value)} data-testid="filter-category">
+        <SearchBar value={search} onChange={setSearch} placeholder="Search service name, category or description…" />
+        <select style={{...inp,minWidth:220}} value={filter} onChange={e=>setFilter(e.target.value)} data-testid="filter-category">
           <option value="">All Categories</option>
           {categories.map(c=><option key={c}>{c}</option>)}
         </select>
+        {(search||filter) && (
+          <button onClick={()=>{ setSearch(""); setFilter(""); }} data-testid="services-clear-filters" style={{ background:"#FEF2F2", color:"#B91C1C", border:"1px solid #FECACA", padding:"6px 12px", borderRadius:8, cursor:"pointer", fontSize:12, fontWeight:700 }}>✕ Clear</button>
+        )}
         <div style={{ marginLeft:"auto" }}>
           {canEdit && <Btn data-testid="add-service-btn" onClick={()=>{ setEditingId(null); setForm({ category:categories[0]||"Nursing & Care", unit:"visit", is_active:true, package_rate:0, standard_rate:0 }); setShowForm(true); }}>+ Add Service</Btn>}
         </div>
@@ -2484,6 +2511,9 @@ function ServicesCatalogModule({ auth, user }) {
 function BillingModule({ auth }) {
   const [bills, setBills] = useState([]);
   const [filterStatus, setFilterStatus] = useState("");
+  const [search, setSearch] = useState("");
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
   const [showPay, setShowPay] = useState(false);
   const [selected, setSelected] = useState(null);
   const [payForm, setPayForm] = useState({ amount:"", mode:"Cash" });
@@ -2494,12 +2524,17 @@ function BillingModule({ auth }) {
   const [billForm, setBillForm] = useState({ is_package:false, line_items:[{}], paid_amount:0, payment_mode:"Cash" });
 
   function load() {
-    const q = filterStatus?`?payment_status=${filterStatus}`:"";
+    const p = new URLSearchParams();
+    if (filterStatus) p.set("payment_status", filterStatus);
+    if (search)       p.set("search", search);
+    if (fromDate)     p.set("from", fromDate);
+    if (toDate)       p.set("to", toDate);
+    const qs = p.toString(); const q = qs ? `?${qs}` : "";
     auth(`/bills${q}`).then(r=>r.json()).then(d=>Array.isArray(d)&&setBills(d)).catch(()=>{});
     auth("/services").then(r=>r.json()).then(d=>Array.isArray(d)&&setServices(d)).catch(()=>{});
     auth("/patients").then(r=>r.json()).then(d=>Array.isArray(d)&&setPatients(d)).catch(()=>{});
   }
-  useEffect(()=>{ load(); },[filterStatus]);
+  useEffect(()=>{ load(); },[filterStatus,search,fromDate,toDate]);
 
   async function recordPayment() {
     const r=await auth(`/bills/${selected.id}/pay`,{ method:"POST", body:JSON.stringify(payForm) });
@@ -2607,10 +2642,16 @@ function BillingModule({ auth }) {
         <StatCard icon="⏳" label="Pending" value={`₹${(totalPending/1000).toFixed(0)}k`} gradient={G.amber} />
       </div>
       <FilterBar>
-        <select style={{...inp,minWidth:160}} value={filterStatus} onChange={e=>setFilterStatus(e.target.value)}>
+        <SearchBar value={search} onChange={setSearch} placeholder="Search receipt #, patient name or mobile…" />
+        <select style={{...inp,minWidth:140}} value={filterStatus} onChange={e=>setFilterStatus(e.target.value)} data-testid="bills-filter-status">
           <option value="">All Status</option>
           {["Pending","Partial","Paid"].map(s=><option key={s}>{s}</option>)}
         </select>
+        <input type="date" data-testid="bills-from-date" value={fromDate} onChange={e=>setFromDate(e.target.value)} title="From date" style={{...inp,minWidth:140}} />
+        <input type="date" data-testid="bills-to-date"   value={toDate}   onChange={e=>setToDate(e.target.value)}   title="To date"   style={{...inp,minWidth:140}} />
+        {(search||filterStatus||fromDate||toDate) && (
+          <button onClick={()=>{ setSearch(""); setFilterStatus(""); setFromDate(""); setToDate(""); }} data-testid="bills-clear-filters" style={{ background:"#FEF2F2", color:"#B91C1C", border:"1px solid #FECACA", padding:"6px 12px", borderRadius:8, cursor:"pointer", fontSize:12, fontWeight:700 }}>✕ Clear</button>
+        )}
         <div style={{ marginLeft:"auto" }}>
           <Btn data-testid="create-bill-btn" onClick={()=>{ setBillForm({ is_package:false, line_items:[{}], paid_amount:0, payment_mode:"Cash" }); setShowCreate(true); }}>+ Create Bill</Btn>
         </div>
@@ -2746,6 +2787,7 @@ function RefundsModule({ auth }) {
   const [refunds, setRefunds] = useState([]);
   const [bills, setBills] = useState([]);
   const [filterStatus, setFilterStatus] = useState("");
+  const [search, setSearch] = useState("");
   const [showForm, setShowForm] = useState(false);
   const [showApprove, setShowApprove] = useState(false);
   const [form, setForm] = useState({});
@@ -2756,11 +2798,15 @@ function RefundsModule({ auth }) {
   const [approveForm, setApproveForm] = useState({ level:"verify", utr:"" });
 
   function load() {
-    auth(`/refunds${filterStatus?`?status=${filterStatus}`:""}`)
+    const p = new URLSearchParams();
+    if (filterStatus) p.set("status", filterStatus);
+    if (search)       p.set("search", search);
+    const qs = p.toString(); const q = qs ? `?${qs}` : "";
+    auth(`/refunds${q}`)
       .then(r=>r.json()).then(d=>Array.isArray(d)&&setRefunds(d)).catch(()=>{});
     auth("/bills").then(r=>r.json()).then(d=>Array.isArray(d)&&setBills(d)).catch(()=>{});
   }
-  useEffect(()=>{ load(); },[filterStatus]);
+  useEffect(()=>{ load(); },[filterStatus,search]);
 
   async function uploadRefundDoc(rid, file, docType) {
     if (!file) return;
@@ -2807,10 +2853,14 @@ function RefundsModule({ auth }) {
   return (
     <div>
       <FilterBar>
-        <select style={{...inp,minWidth:160}} value={filterStatus} onChange={e=>setFilterStatus(e.target.value)}>
+        <SearchBar value={search} onChange={setSearch} placeholder="Search patient name, reason or refund ID…" />
+        <select style={{...inp,minWidth:160}} value={filterStatus} onChange={e=>setFilterStatus(e.target.value)} data-testid="refunds-filter-status">
           <option value="">All Statuses</option>
           {["Pending","Verified","Approved","Rejected"].map(s=><option key={s}>{s}</option>)}
         </select>
+        {(search||filterStatus) && (
+          <button onClick={()=>{ setSearch(""); setFilterStatus(""); }} data-testid="refunds-clear-filters" style={{ background:"#FEF2F2", color:"#B91C1C", border:"1px solid #FECACA", padding:"6px 12px", borderRadius:8, cursor:"pointer", fontSize:12, fontWeight:700 }}>✕ Clear</button>
+        )}
         <div style={{ marginLeft:"auto" }}><Btn onClick={()=>{ setForm({ mode:"NEFT" }); setShowForm(true); }}>+ Initiate Refund</Btn></div>
       </FilterBar>
       <Card>

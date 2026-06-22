@@ -1216,13 +1216,23 @@ async def reassign_booking(bid: int, body: Dict[str, Any], user=Depends(current_
 @api.get("/bills")
 async def list_bills(patient_id: Optional[int]=None, payment_status: Optional[str]=None,
                      frm: Optional[str]=Query(None, alias="from"), to: Optional[str]=None,
-                     user=Depends(current_user)):
+                     search: Optional[str]=None, user=Depends(current_user)):
     q = {}
     if patient_id: q["patient_id"] = patient_id
     if payment_status: q["payment_status"] = payment_status
     if frm: q["date"] = {"$gte": frm}
     if to: q.setdefault("date", {})["$lte"] = to
-    return await list_col("bills", q)
+    rows = await list_col("bills", q)
+    if search:
+        s = search.strip().lower()
+        rows = [
+            b for b in rows
+            if s in str(b.get("receipt_number","")).lower()
+            or s in (b.get("patient_name","") or "").lower()
+            or s in (b.get("patient_mobile","") or "").lower()
+            or s in (b.get("payer_name","") or "").lower()
+        ]
+    return rows
 
 @api.post("/bills")
 async def create_bill(body: Dict[str, Any], user=Depends(current_user)):
@@ -1375,9 +1385,20 @@ async def pay_bill(bid: int, body: Dict[str, Any], user=Depends(current_user)):
     return {"message": "Payment recorded", "receipt_number": rcpt_num, "payment_idx": len(b.get("payments") or [])}
 
 @api.get("/refunds")
-async def list_refunds(status: Optional[str]=None, user=Depends(current_user)):
+async def list_refunds(status: Optional[str]=None, search: Optional[str]=None,
+                       user=Depends(current_user)):
     q = {"status": status} if status else {}
-    return await list_col("refunds", q, sort=("id", -1))
+    rows = await list_col("refunds", q, sort=("id", -1))
+    if search:
+        s = search.strip().lower()
+        rows = [
+            r for r in rows
+            if s in (r.get("patient_name","") or "").lower()
+            or s in str(r.get("id","")).lower()
+            or s in str(r.get("receipt_id","")).lower()
+            or s in (r.get("reason","") or "").lower()
+        ]
+    return rows
 
 @api.post("/refunds")
 async def add_refund(d: Dict[str, Any], user=Depends(current_user)):
