@@ -1,0 +1,36 @@
+{
+  "summary": "Backend-only verification of the Wallet module bug fix. 15 pytest test cases covering auth, patient seed, the rewritten GET /api/wallets (the core fix), search/min_balance filters, per-patient wallet (get/adjust/transactions/dashboard-stats), new-patient wallet auto-creation, refund-requests workflow, role-based permission checks (admin/manager/accountant allowed, staff/foe blocked with 403), and idempotency of /app/backend/migrate_wallets.py. 14/15 PASSED. One real backend bug found: GET /api/wallet/refund-requests is shadowed by the /wallet/{pid:int} route declared earlier — FastAPI tries to parse 'refund-requests' as int and returns 422.",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "GET /api/wallet/refund-requests",
+        "issue": "Returns 422 'Input should be a valid integer, unable to parse string as an integer, input=refund-requests'. Cause: route /wallet/{pid:int} at line 1960 is registered BEFORE /wallet/refund-requests at line 2030, so FastAPI matches the parametric route first and fails int validation on the literal string. Fix: move @api.get('/wallet/refund-requests') and @api.patch('/wallet/refund-requests/{rid}/status') above @api.get('/wallet/{pid}') in /app/backend/server.py (i.e. declare static routes before path-parameter routes).",
+        "priority": "CRITICAL"
+      }
+    ],
+    "minor": []
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_wallet_module.py",
+    "/app/test_reports/pytest/wallet_results.xml"
+  ],
+  "action_items": [
+    "Reorder routes in /app/backend/server.py so static /wallet/refund-requests (GET) and /wallet/refund-requests/{rid}/status (PATCH) are declared BEFORE /wallet/{pid} (GET). This unblocks the Wallet UI Refund Requests tab. After fix, re-run pytest /app/backend/tests/test_wallet_module.py::TestRefundRequests to confirm."
+  ],
+  "critical_code_review_comments": [
+    "Route-ordering bug for /api/wallet/refund-requests as above — critical, blocks refund-request listing.",
+    "server.py is 4248 lines — should be split into modular routers (auth, patients, wallet, billing, etc.) for maintainability.",
+    "_ensure_wallet() is correctly idempotent and is invoked from POST /api/patients and from list_wallets() — good. Concurrent creates could theoretically race; consider a unique index on patient_wallets.patient_id to guarantee single-doc-per-patient at the DB level.",
+    "backfill_wallets() runs on every startup — fine for now but eventually a one-shot migration with a flag would be cleaner.",
+    "GET /api/wallets loads ALL patients + ALL wallets in memory (no pagination). Acceptable for current scale (7 patients) but won't scale; consider server-side pagination + an aggregation pipeline join."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "93% (14/15)", "frontend": "not tested (skipped per request)"},
+  "test_credentials": "admin/Admin@1234, manager/Manager@1234, accountant/Account@1234, foe/Foe@1234 — all working. Login endpoint is /api/login (not /api/auth/login).",
+  "seed_data_creation": "Tests create one TEST_Patient_<hex> per run via POST /api/patients (auto-creates wallet, balance=0). No cleanup performed; main agent may purge later if needed.",
+  "retest_needed": true,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "All wallet endpoints under /api/wallet/* and /api/wallets verified except GET /api/wallet/refund-requests (route shadowing bug). The list /api/wallets now correctly returns 7+ rows (one per Active patient) with patient_name/mobile/reg_number/current_balance/total_credited/total_debited/total_refunded and supports search & min_balance filters. Permission gate (admin/manager/accountant=200, staff=403) works. POST /api/patients auto-creates wallet via _ensure_wallet. migrate_wallets.py is idempotent. Each test run credits patient 1 by ₹5000 + ₹1000 → balance grows across runs; tests are resilient to this.",
+  "rca of the issue": "FastAPI route ordering: /wallet/{pid:int} declared at line 1960 catches the request for /wallet/refund-requests at line 2030. Reproduction: curl -H 'Authorization: Bearer <admin>' https://wallet-render-fix.preview.emergentagent.com/api/wallet/refund-requests → HTTP 422 with detail input='refund-requests'. Mitigation: move static-segment routes above path-param routes (or use a non-colliding prefix like /wallet-refund-requests)."
+}
