@@ -1957,6 +1957,60 @@ async def list_wallets(min_balance: Optional[float]=None,
     out.sort(key=lambda r: (-r["current_balance"], r["patient_name"].lower()))
     return out
 
+# ── Refund Request listing/status (declared BEFORE /wallet/{pid} to avoid
+#    FastAPI route shadowing — otherwise /wallet/refund-requests is matched
+#    against /wallet/{pid:int} and returns 422.)
+@api.get("/wallet/refund-requests")
+async def list_refund_requests(status: Optional[str]=None,
+                               patient_id: Optional[int]=None,
+                               user=Depends(current_user)):
+    q = {}
+    if status: q["status"] = status
+    if patient_id: q["patient_id"] = patient_id
+    rows = await list_col("wallet_refund_requests", q)
+    pmap = {p["id"]: p for p in await list_col("patients")}
+    for r in rows:
+        p = pmap.get(r.get("patient_id"), {})
+        r["patient_name"]   = p.get("name", "")
+        r["patient_mobile"] = p.get("mobile", "")
+        r["reg_number"]     = p.get("reg_number", "")
+    return rows
+
+@api.patch("/wallet/refund-requests/{rid}/status")
+async def update_refund_request(rid: int, body: Dict[str, Any], user=Depends(current_user)):
+    if not is_super_admin(user):
+        raise HTTPException(403, "Only Super Admin can update refund request status")
+    cur = await db.wallet_refund_requests.find_one({"id": rid})
+    if not cur:
+        raise HTTPException(404, "Refund request not found")
+    new_status = body.get("status")
+    if new_status not in ("Approved", "Rejected", "Completed"):
+        raise HTTPException(400, "status must be Approved, Rejected, or Completed")
+    if cur.get("status") in ("Completed", "Rejected"):
+        raise HTTPException(400, f"Already {cur.get('status')}")
+
+    update = {"status": new_status, "updated_at": now_iso(),
+              "actioned_by": user.get("name"), "actioned_by_role": user.get("role")}
+    if new_status == "Approved":
+        update["approved_at"] = now_iso()
+        update["approval_remarks"] = body.get("remarks") or ""
+    elif new_status == "Rejected":
+        update["rejected_at"] = now_iso()
+        update["rejection_reason"] = body.get("remarks") or "Rejected by admin"
+    elif new_status == "Completed":
+        if cur.get("status") not in ("Pending", "Approved"):
+            raise HTTPException(400, "Must be Pending or Approved before Completed")
+        tx = await _wallet_tx(cur["patient_id"], "REFUND", cur["amount"],
+                              "Refund Request", rid,
+                              f"Refund completed (mode={cur.get('payment_mode','-')}, ref={cur.get('bank_ref','-')})",
+                              user)
+        update["completed_at"] = now_iso()
+        update["wallet_transaction_id"] = tx["id"]
+
+    await db.wallet_refund_requests.update_one({"id": rid}, {"$set": update})
+    await audit(user, "wallet_refund_request_update", "wallet_refund_request", rid, cur, update)
+    return {"message": f"Refund request {new_status}"}
+
 @api.get("/wallet/{pid}")
 async def get_wallet(pid: int, user=Depends(current_user)):
     w = await _ensure_wallet(pid)
@@ -2026,57 +2080,6 @@ async def create_refund_request(pid: int, body: Dict[str, Any], user=Depends(cur
     await db.wallet_refund_requests.insert_one(doc)
     await audit(user, "wallet_refund_request_create", "wallet_refund_request", doc["id"], None, doc)
     return {"id": doc["id"], "message": "Refund request created (Pending approval)"}
-
-@api.get("/wallet/refund-requests")
-async def list_refund_requests(status: Optional[str]=None,
-                               patient_id: Optional[int]=None,
-                               user=Depends(current_user)):
-    q = {}
-    if status: q["status"] = status
-    if patient_id: q["patient_id"] = patient_id
-    rows = await list_col("wallet_refund_requests", q)
-    pmap = {p["id"]: p for p in await list_col("patients")}
-    for r in rows:
-        p = pmap.get(r.get("patient_id"), {})
-        r["patient_name"]   = p.get("name", "")
-        r["patient_mobile"] = p.get("mobile", "")
-        r["reg_number"]     = p.get("reg_number", "")
-    return rows
-
-@api.patch("/wallet/refund-requests/{rid}/status")
-async def update_refund_request(rid: int, body: Dict[str, Any], user=Depends(current_user)):
-    if not is_super_admin(user):
-        raise HTTPException(403, "Only Super Admin can update refund request status")
-    cur = await db.wallet_refund_requests.find_one({"id": rid})
-    if not cur:
-        raise HTTPException(404, "Refund request not found")
-    new_status = body.get("status")
-    if new_status not in ("Approved", "Rejected", "Completed"):
-        raise HTTPException(400, "status must be Approved, Rejected, or Completed")
-    if cur.get("status") in ("Completed", "Rejected"):
-        raise HTTPException(400, f"Already {cur.get('status')}")
-
-    update = {"status": new_status, "updated_at": now_iso(),
-              "actioned_by": user.get("name"), "actioned_by_role": user.get("role")}
-    if new_status == "Approved":
-        update["approved_at"] = now_iso()
-        update["approval_remarks"] = body.get("remarks") or ""
-    elif new_status == "Rejected":
-        update["rejected_at"] = now_iso()
-        update["rejection_reason"] = body.get("remarks") or "Rejected by admin"
-    elif new_status == "Completed":
-        if cur.get("status") not in ("Pending", "Approved"):
-            raise HTTPException(400, "Must be Pending or Approved before Completed")
-        tx = await _wallet_tx(cur["patient_id"], "REFUND", cur["amount"],
-                              "Refund Request", rid,
-                              f"Refund completed (mode={cur.get('payment_mode','-')}, ref={cur.get('bank_ref','-')})",
-                              user)
-        update["completed_at"] = now_iso()
-        update["wallet_transaction_id"] = tx["id"]
-
-    await db.wallet_refund_requests.update_one({"id": rid}, {"$set": update})
-    await audit(user, "wallet_refund_request_update", "wallet_refund_request", rid, cur, update)
-    return {"message": f"Refund request {new_status}"}
 
 # ── Booking lifecycle: STOP (credit wallet) & CONVERT (recalc + new booking) ──
 @api.post("/bookings/{bid}/stop")
