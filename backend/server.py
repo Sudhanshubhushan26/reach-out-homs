@@ -399,6 +399,7 @@ async def on_start():
     await seed()
     await backfill_wallets()
     await reconcile_wallet_credits_from_bookings()
+    await reconcile_wallet_credits_from_bills()
     await recompute_wallet_balances_from_transactions()
     logger.info("Reach Out HOMS backend started")
 
@@ -516,6 +517,73 @@ async def reconcile_wallet_credits_from_bookings():
         }
     except Exception as e:
         logger.warning(f"Wallet reconciliation failed: {e}")
+        return {"error": str(e)}
+
+
+async def reconcile_wallet_credits_from_bills():
+    """Backfill wallet credits for existing PAID bills.
+
+    For every bill with paid_amount > 0, ensure a wallet CREDIT transaction
+    exists referenced as ("Bill", bill.id). Idempotent.
+    Additional payments recorded in `bill.payments[]` (beyond the first) are
+    each credited as ("Bill Payment", "{bid}.{idx}").
+    """
+    try:
+        created_initial = 0
+        created_extra = 0
+        scanned = 0
+        async for b in db.bills.find({}, {"_id": 0}):
+            scanned += 1
+            pid = b.get("patient_id")
+            bid = b.get("id")
+            if not pid or not bid:
+                continue
+            paid = float(b.get("paid_amount") or 0)
+            payments = b.get("payments") or []
+            # Initial bill credit (sum of first payment OR full paid if no payments[] history)
+            initial_amount = float(payments[0]["amount"]) if payments else paid
+            if initial_amount > 0:
+                existing = await db.wallet_transactions.find_one({
+                    "patient_id": pid, "reference_type": "Bill", "reference_id": bid,
+                })
+                if not existing:
+                    try:
+                        await _wallet_tx(
+                            pid, "CREDIT", initial_amount,
+                            "Bill", bid,
+                            f"[Reconciliation] Bill #{b.get('receipt_number') or bid} payment recovered",
+                            {"name": "system-reconciliation", "role": "admin"},
+                        )
+                        created_initial += 1
+                    except Exception as e:
+                        logger.warning(f"bill->wallet backfill failed for bill {bid}: {e}")
+            # Additional payments (index >= 1)
+            for i, p in enumerate(payments[1:], start=1):
+                amt = float(p.get("amount") or 0)
+                if amt <= 0: continue
+                ref_id = f"{bid}.{i}"
+                existing = await db.wallet_transactions.find_one({
+                    "patient_id": pid, "reference_type": "Bill Payment", "reference_id": ref_id,
+                })
+                if existing: continue
+                try:
+                    await _wallet_tx(
+                        pid, "CREDIT", amt,
+                        "Bill Payment", ref_id,
+                        f"[Reconciliation] Bill #{b.get('receipt_number') or bid} payment #{i+1} recovered",
+                        {"name": "system-reconciliation", "role": "admin"},
+                    )
+                    created_extra += 1
+                except Exception as e:
+                    logger.warning(f"bill payment->wallet backfill failed for bill {bid} idx {i}: {e}")
+        logger.info(
+            f"Bill->wallet reconciliation: scanned {scanned}, "
+            f"created {created_initial} initial credits + {created_extra} extra-payment credits"
+        )
+        return {"bills_scanned": scanned, "initial_credits_created": created_initial,
+                "extra_payment_credits_created": created_extra}
+    except Exception as e:
+        logger.warning(f"Bill->wallet reconciliation failed: {e}")
         return {"error": str(e)}
 
 
@@ -1208,6 +1276,25 @@ async def create_bill(body: Dict[str, Any], user=Depends(current_user)):
     }
     await db.bills.insert_one(bill)
     await audit(user, "create", "bill", bid_int, notes=f"₹{total} rcpt {rcpt_num}")
+    # Credit the patient's wallet for the amount paid against this bill so the
+    # wallet ledger reflects all money received from the patient. Idempotent
+    # via (patient_id, reference_type="Bill", reference_id=bid_int).
+    if paid > 0:
+        try:
+            existing = await db.wallet_transactions.find_one({
+                "patient_id": body["patient_id"],
+                "reference_type": "Bill",
+                "reference_id": bid_int,
+            })
+            if not existing:
+                await _wallet_tx(
+                    body["patient_id"], "CREDIT", paid,
+                    "Bill", bid_int,
+                    f"Bill #{rcpt_num} paid via {body.get('payment_mode','Cash')}",
+                    user,
+                )
+        except Exception as e:
+            logger.warning(f"bill->wallet credit failed for bill {bid_int}: {e}")
     return {"id": bid_int, "receipt_number": rcpt_num, "total_amount": total, "balance": total - paid, "message": "Bill created"}
 
 @api.post("/bills/{bid}/pay")
@@ -1233,6 +1320,27 @@ async def pay_bill(bid: int, body: Dict[str, Any], user=Depends(current_user)):
         "$push": {"payments": new_payment}
     })
     await audit(user, "update", "bill", bid, notes=f"payment ₹{add_paid} rcpt {rcpt_num}")
+    # Credit wallet for the additional payment. Reference includes the payment
+    # index so multiple payments on one bill each create a distinct credit
+    # (idempotent across re-runs: if same payment_idx already credited, skip).
+    if add_paid > 0:
+        pay_idx = len(b.get("payments") or [])  # index of the NEW payment just pushed
+        ref_id = f"{bid}.{pay_idx}"
+        try:
+            existing = await db.wallet_transactions.find_one({
+                "patient_id": b.get("patient_id"),
+                "reference_type": "Bill Payment",
+                "reference_id": ref_id,
+            })
+            if not existing and b.get("patient_id"):
+                await _wallet_tx(
+                    b["patient_id"], "CREDIT", add_paid,
+                    "Bill Payment", ref_id,
+                    f"Bill #{b.get('receipt_number') or bid} additional payment ({body.get('mode','Cash')}) rcpt {rcpt_num}",
+                    user,
+                )
+        except Exception as e:
+            logger.warning(f"bill payment->wallet credit failed for bill {bid}: {e}")
     return {"message": "Payment recorded", "receipt_number": rcpt_num, "payment_idx": len(b.get("payments") or [])}
 
 @api.get("/refunds")
@@ -2065,13 +2173,15 @@ async def admin_recalculate_wallets(user=Depends(current_user)):
     if not is_super_admin(user):
         raise HTTPException(403, "Only Super Admin can recalculate wallets")
     backfill = await backfill_wallets() or {}
-    recon    = await reconcile_wallet_credits_from_bookings() or {}
+    recon     = await reconcile_wallet_credits_from_bookings() or {}
+    recon_bil = await reconcile_wallet_credits_from_bills() or {}
     recompute = await recompute_wallet_balances_from_transactions() or {}
     await audit(user, "wallet_recalculate", "wallet", None, None,
-                {"reconciliation": recon, "recompute": recompute})
+                {"reconciliation": recon, "bill_reconciliation": recon_bil, "recompute": recompute})
     return {
         "message": "Wallet recalculation complete",
         "reconciliation": recon,
+        "bill_reconciliation": recon_bil,
         "balance_recompute": recompute,
     }
 
