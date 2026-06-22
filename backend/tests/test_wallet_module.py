@@ -285,11 +285,16 @@ class TestRefundRequests:
         rows = r1.json()
         assert len(rows) >= initial_count + 1, f"list did not grow: before={initial_count} after={len(rows)}"
 
-        # Find our newly created row for patient 1
+        # Find our newly created row for patient 1 — pick the one with the highest id
+        # (i.e. the most recently created) to avoid picking a stale Completed row from
+        # a previous test run that has the same amount.
         mine = [r_ for r_ in rows if r_.get("patient_id") == 1 and float(r_.get("amount", 0)) == refund_amount]
         assert mine, "newly created refund request not found in listing"
-        row = mine[-1]
-        if rid is None:
+        if rid is not None:
+            matched = [r_ for r_ in mine if r_.get("id") == rid]
+            row = matched[0] if matched else max(mine, key=lambda x: int(x.get("id") or 0))
+        else:
+            row = max(mine, key=lambda x: int(x.get("id") or 0))
             rid = row.get("id")
 
         # Verify enrichment fields present
@@ -361,7 +366,7 @@ class TestRefundRequests:
         rl = requests.get(f"{API}/wallet/refund-requests?status=Pending", headers=H(admin_token), timeout=15).json()
         mine = [r_ for r_ in rl if r_.get("patient_id") == 1 and float(r_.get("amount", 0)) == 100.0]
         assert mine
-        rid = mine[-1]["id"]
+        rid = max(mine, key=lambda x: int(x.get("id") or 0))["id"]
         bad = requests.patch(f"{API}/wallet/refund-requests/{rid}/status",
                              headers=H(admin_token),
                              json={"status": "Garbage"}, timeout=15)
@@ -408,3 +413,214 @@ class TestMigrationScript:
         low = combined.lower()
         # Should report 0 created since startup backfill already ran
         assert "created" in low or "wallet" in low, f"unexpected output: {combined}"
+
+
+
+# ─────────────── Iteration 3 — Wallet recovery / reconciliation ───────────────
+class TestWalletAdminRecalculate:
+    """Coverage for POST /api/wallet/admin/recalculate.
+
+    Validates:
+      * 200 OK + correct response shape for admin
+      * 403 for every non-admin role (manager / accountant / foe / staff)
+      * Idempotency — second call reports created=0
+      * End-to-end recovery: stop booking 2 → wipe ledger via pymongo →
+        recalculate → wallet balance recovered
+      * Startup hooks intact (iter-1 wallets list & iter-2 refund-requests)
+      * Dashboard stats reflect post-recalculation totals
+    """
+
+    ENDPOINT = f"{API}/wallet/admin/recalculate"
+
+    def test_recalculate_as_admin_returns_correct_shape(self, admin_token):
+        r = requests.post(self.ENDPOINT, headers=H(admin_token), timeout=30)
+        assert r.status_code == 200, f"admin should get 200, got {r.status_code}: {r.text}"
+        body = r.json()
+        assert "reconciliation" in body, f"missing 'reconciliation' key: {body}"
+        assert "balance_recompute" in body, f"missing 'balance_recompute' key: {body}"
+        recon = body["reconciliation"]
+        for k in ("created", "skipped_already_credited", "skipped_no_refundable", "bookings_scanned"):
+            assert k in recon, f"reconciliation missing '{k}': {recon}"
+            assert isinstance(recon[k], int), f"reconciliation.{k} must be int, got {type(recon[k]).__name__}"
+        recomp = body["balance_recompute"]
+        assert "recomputed" in recomp, f"balance_recompute missing 'recomputed': {recomp}"
+        assert isinstance(recomp["recomputed"], int)
+
+    def test_recalculate_blocked_for_manager(self, manager_token):
+        r = requests.post(self.ENDPOINT, headers=H(manager_token), timeout=15)
+        assert r.status_code == 403, f"manager must be 403, got {r.status_code}: {r.text}"
+
+    def test_recalculate_blocked_for_accountant(self, accountant_token):
+        r = requests.post(self.ENDPOINT, headers=H(accountant_token), timeout=15)
+        assert r.status_code == 403, f"accountant must be 403, got {r.status_code}: {r.text}"
+
+    def test_recalculate_blocked_for_foe_staff(self, staff_token):
+        r = requests.post(self.ENDPOINT, headers=H(staff_token), timeout=15)
+        assert r.status_code == 403, f"foe must be 403, got {r.status_code}: {r.text}"
+
+    def test_recalculate_unauthenticated_blocked(self):
+        r = requests.post(self.ENDPOINT, timeout=15)
+        assert r.status_code in (401, 403), f"unauth must be 401/403, got {r.status_code}: {r.text}"
+
+    def test_recalculate_idempotent_back_to_back(self, admin_token):
+        # First call
+        r1 = requests.post(self.ENDPOINT, headers=H(admin_token), timeout=30)
+        assert r1.status_code == 200, r1.text
+        # Second call immediately after — must create 0 new wallet credits
+        r2 = requests.post(self.ENDPOINT, headers=H(admin_token), timeout=30)
+        assert r2.status_code == 200, r2.text
+        body2 = r2.json()
+        assert body2["reconciliation"]["created"] == 0, (
+            f"idempotency violated — 2nd call created "
+            f"{body2['reconciliation']['created']} new credits: {body2}"
+        )
+
+    def test_end_to_end_recovery_for_booking_2(self, admin_token):
+        """(a) stop booking 2 → (b) wipe wallet_transactions+zero wallet via pymongo →
+        (c) call /admin/recalculate → (d) verify GET /api/wallet/2 balance recovered."""
+        from datetime import date
+
+        # ── Step 0: read MONGO_URL + DB_NAME from backend/.env so we can simulate data loss ──
+        env_path = "/app/backend/.env"
+        mongo_url = None
+        db_name = None
+        if os.path.exists(env_path):
+            for line in open(env_path):
+                line = line.strip()
+                if line.startswith("MONGO_URL"):
+                    mongo_url = line.split("=", 1)[1].strip().strip('"').strip("'")
+                elif line.startswith("DB_NAME"):
+                    db_name = line.split("=", 1)[1].strip().strip('"').strip("'")
+        if not mongo_url or not db_name:
+            pytest.skip("MONGO_URL/DB_NAME not available — cannot simulate data loss")
+
+        from pymongo import MongoClient
+        sync_db = MongoClient(mongo_url, serverSelectionTimeoutMS=5000)[db_name]
+
+        # ── Step 0b: ensure booking 2 (Brijesh Kumar) is Active. If a previous run
+        # already stopped it, the e2e flow still works — we just credit it once and
+        # then wipe & recover. ──
+        bk = sync_db.bookings.find_one({"id": 2})
+        assert bk, "booking 2 missing from DB — seed broken"
+        pid = bk.get("patient_id")
+        assert pid == 2, f"booking 2 patient_id must be 2 (Brijesh Kumar), got {pid}"
+
+        if bk.get("status") not in ("Stopped", "Converted", "Cancelled"):
+            # Stop the booking → should credit wallet of patient 2
+            stop_resp = requests.post(
+                f"{API}/bookings/2/stop", headers=H(admin_token),
+                json={"stop_date": date.today().isoformat(), "reason": "TEST_e2e_recovery"},
+                timeout=20,
+            )
+            assert stop_resp.status_code == 200, f"stop booking 2 failed: {stop_resp.status_code} {stop_resp.text}"
+
+        # Now there should be a CREDIT for booking 2 — capture original refundable
+        bk_after_stop = sync_db.bookings.find_one({"id": 2})
+        assert bk_after_stop["status"] in ("Stopped", "Converted", "Cancelled"), \
+            f"expected booking 2 to be Stopped, got {bk_after_stop.get('status')}"
+        original_refundable = float(bk_after_stop.get("refundable_amount") or 0)
+        assert original_refundable > 0, (
+            f"booking 2 has no refundable amount after stop — paid={bk_after_stop.get('paid_amount')} "
+            f"consumed={bk_after_stop.get('consumed_amount')}"
+        )
+
+        # Confirm wallet credited
+        rw_before_wipe = requests.get(f"{API}/wallet/2", headers=H(admin_token), timeout=15).json()
+        balance_before_wipe = float(rw_before_wipe.get("current_balance") or 0)
+        assert balance_before_wipe >= original_refundable, (
+            f"wallet not credited after stop: balance={balance_before_wipe} expected>={original_refundable}"
+        )
+
+        # ── Step (b): simulate data loss — wipe wallet_transactions for booking 2
+        # and zero out the patient_wallets row. ──
+        del_res = sync_db.wallet_transactions.delete_many({"patient_id": 2, "reference_id": 2})
+        assert del_res.deleted_count >= 1, f"expected to delete at least 1 wallet_tx, got {del_res.deleted_count}"
+        sync_db.patient_wallets.update_one(
+            {"patient_id": 2},
+            {"$set": {"current_balance": 0.0, "total_credited": 0.0,
+                      "total_debited": 0.0, "total_refunded": 0.0}},
+        )
+
+        # Confirm the wipe took effect
+        rw_after_wipe = requests.get(f"{API}/wallet/2", headers=H(admin_token), timeout=15).json()
+        balance_after_wipe = float(rw_after_wipe.get("current_balance") or 0)
+        # The wipe may leave non-booking-2 credits intact (e.g. unrelated adjustments).
+        # But the booking-2 credit specifically must be gone. We verify balance dropped
+        # by at least original_refundable.
+        assert balance_after_wipe <= balance_before_wipe - original_refundable + 0.01, (
+            f"wipe ineffective: before={balance_before_wipe} after={balance_after_wipe} "
+            f"refundable={original_refundable}"
+        )
+
+        # ── Step (c): call admin recalculate ──
+        rc = requests.post(self.ENDPOINT, headers=H(admin_token), timeout=30)
+        assert rc.status_code == 200, rc.text
+        rc_body = rc.json()
+        # Must have created at least 1 wallet credit during reconciliation
+        assert rc_body["reconciliation"]["created"] >= 1, (
+            f"recovery failed — expected >=1 created, got: {rc_body}"
+        )
+
+        # ── Step (d): verify GET /api/wallet/2 shows the original credit recovered ──
+        rw_recovered = requests.get(f"{API}/wallet/2", headers=H(admin_token), timeout=15).json()
+        balance_recovered = float(rw_recovered.get("current_balance") or 0)
+        assert balance_recovered >= original_refundable - 0.01, (
+            f"balance NOT recovered: expected>={original_refundable}, got {balance_recovered}"
+        )
+
+        # And the wallet_transactions ledger has the credit back, keyed on booking 2
+        txs = requests.get(f"{API}/wallet/2/transactions", headers=H(admin_token), timeout=15).json()
+        recovered_tx = [t for t in txs
+                        if int(t.get("reference_id") or 0) == 2
+                        and (t.get("transaction_type") or "").upper() in ("CREDIT", "ADJUSTMENT")]
+        assert recovered_tx, f"no recovery CREDIT tx found in ledger for booking 2: {txs[:3]}"
+        assert round(float(recovered_tx[-1].get("amount") or 0), 2) == round(original_refundable, 2), (
+            f"recovery tx amount mismatch: expected {original_refundable}, got {recovered_tx[-1].get('amount')}"
+        )
+
+        # ── Bonus: now that data is recovered, recalc again must be idempotent ──
+        rc2 = requests.post(self.ENDPOINT, headers=H(admin_token), timeout=30)
+        assert rc2.status_code == 200
+        assert rc2.json()["reconciliation"]["created"] == 0, (
+            f"recalc not idempotent after recovery: {rc2.json()}"
+        )
+
+    def test_startup_hooks_still_green_after_recalc(self, admin_token):
+        """iter-1: GET /api/wallets returns >=7 active patients.
+        iter-2: GET /api/wallet/refund-requests returns 200.
+        iter-3: GET /api/wallet/{pid} auto-creates wallet for any active patient."""
+        # iter-1
+        r = requests.get(f"{API}/wallets?min_balance=0", headers=H(admin_token), timeout=15)
+        assert r.status_code == 200
+        assert len(r.json()) >= 7, f"iter-1 broken — only {len(r.json())} wallets"
+        # iter-2
+        r = requests.get(f"{API}/wallet/refund-requests", headers=H(admin_token), timeout=15)
+        assert r.status_code == 200, f"iter-2 broken — refund-requests: {r.status_code} {r.text}"
+        assert isinstance(r.json(), list)
+        # iter-3 — wallet auto-create
+        r = requests.get(f"{API}/wallet/3", headers=H(admin_token), timeout=15)
+        assert r.status_code == 200, r.text
+        w = r.json()
+        assert w.get("patient_id") == 3
+        assert "current_balance" in w
+
+    def test_dashboard_stats_reflect_post_recalculation(self, admin_token):
+        """After recalculate, dashboard totalWalletBalance must equal the sum of
+        all current_balance values from the wallet list."""
+        rc = requests.post(self.ENDPOINT, headers=H(admin_token), timeout=30)
+        assert rc.status_code == 200, rc.text
+
+        wallets = requests.get(f"{API}/wallets?min_balance=0", headers=H(admin_token), timeout=15).json()
+        sum_of_balances = round(sum(float(w.get("current_balance") or 0) for w in wallets), 2)
+
+        ds = requests.get(f"{API}/wallet/dashboard-stats", headers=H(admin_token), timeout=15).json()
+        total = round(float(ds.get("totalWalletBalance") or 0), 2)
+
+        assert abs(total - sum_of_balances) < 0.5, (
+            f"dashboard totalWalletBalance ({total}) drifted from sum of wallet list ({sum_of_balances})"
+        )
+        # patientsWithBalance must match count of wallets with positive balance
+        pos = sum(1 for w in wallets if float(w.get("current_balance") or 0) > 0)
+        assert ds.get("patientsWithBalance") == pos, (
+            f"patientsWithBalance mismatch: dashboard={ds.get('patientsWithBalance')} actual={pos}"
+        )

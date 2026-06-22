@@ -398,6 +398,8 @@ async def seed():
 async def on_start():
     await seed()
     await backfill_wallets()
+    await reconcile_wallet_credits_from_bookings()
+    await recompute_wallet_balances_from_transactions()
     logger.info("Reach Out HOMS backend started")
 
 
@@ -433,6 +435,136 @@ async def backfill_wallets():
             logger.info("Wallet backfill: all patients already have wallet records")
     except Exception as e:
         logger.warning(f"Wallet backfill failed: {e}")
+
+
+async def reconcile_wallet_credits_from_bookings():
+    """One-shot historical reconciliation.
+
+    For every Stopped / Converted / Cancelled booking where the patient paid
+    more than they consumed, ensure a corresponding wallet CREDIT transaction
+    exists. If it doesn't (e.g. lost during a DB migration), create it now and
+    update the wallet balance accordingly.
+
+    Idempotent: we look up wallet_transactions by `reference_id == booking.id`
+    and skip any that already have a credit recorded.
+    """
+    try:
+        target_statuses = ("Stopped", "Converted", "Cancelled")
+        bookings = await db.bookings.find(
+            {"status": {"$in": list(target_statuses)}}, {"_id": 0}
+        ).to_list(10000)
+        created = 0
+        skipped_existing = 0
+        skipped_no_refund = 0
+        for b in bookings:
+            bid = b.get("id")
+            pid = b.get("patient_id")
+            if not bid or not pid:
+                continue
+
+            paid = float(b.get("paid_amount") or 0)
+            # Prefer the value persisted by stop_booking/convert_booking;
+            # otherwise compute from rates/dates.
+            consumed = b.get("consumed_amount")
+            if consumed is None:
+                consumed = _calc_consumed_amount(b, b.get("stop_date") or b.get("end_date"))
+            try:
+                consumed = float(consumed or 0)
+            except Exception:
+                consumed = 0.0
+            if consumed > paid:
+                consumed = paid
+            refundable = round(paid - consumed, 2)
+            if refundable <= 0:
+                skipped_no_refund += 1
+                continue
+
+            # Skip if we already recorded a credit for this booking
+            existing = await db.wallet_transactions.find_one({
+                "patient_id": pid,
+                "reference_id": bid,
+                "transaction_type": {"$in": ["CREDIT", "REFUND", "ADJUSTMENT"]},
+            })
+            if existing:
+                skipped_existing += 1
+                continue
+
+            ref_type = "Service Conversion" if b.get("status") == "Converted" else "Service Cancellation"
+            remarks = (
+                f"[Reconciliation] {b.get('booking_id') or bid} {b.get('status','').lower()} "
+                f"— consumed ₹{consumed:.2f} of paid ₹{paid:.2f}"
+            )
+            try:
+                await _wallet_tx(
+                    pid, "CREDIT", refundable,
+                    ref_type, bid, remarks,
+                    {"name": "system-reconciliation", "role": "admin"},
+                )
+                created += 1
+            except Exception as e:
+                logger.warning(f"reconcile: failed for booking {bid}: {e}")
+
+        logger.info(
+            f"Wallet reconciliation: created {created} credit txns "
+            f"(skipped {skipped_existing} already-credited, {skipped_no_refund} with no refundable)"
+        )
+        return {
+            "created": created,
+            "skipped_already_credited": skipped_existing,
+            "skipped_no_refundable": skipped_no_refund,
+            "bookings_scanned": len(bookings),
+        }
+    except Exception as e:
+        logger.warning(f"Wallet reconciliation failed: {e}")
+        return {"error": str(e)}
+
+
+async def recompute_wallet_balances_from_transactions():
+    """Recompute every patient_wallet's totals from wallet_transactions.
+
+    Safety net: if balances ever drift from the transaction ledger (data
+    corruption, partial migration, mis-applied updates), this brings them
+    back into agreement with the source of truth.
+    """
+    try:
+        # Aggregate sums per patient + per transaction_type
+        pipe = [
+            {"$group": {
+                "_id": {"pid": "$patient_id", "ty": "$transaction_type"},
+                "total": {"$sum": "$amount"},
+            }},
+        ]
+        rows = await db.wallet_transactions.aggregate(pipe).to_list(100000)
+        agg: Dict[int, Dict[str, float]] = {}
+        for r in rows:
+            pid = r["_id"]["pid"]
+            ty  = (r["_id"]["ty"] or "").upper()
+            agg.setdefault(pid, {"CREDIT": 0.0, "ADJUSTMENT": 0.0, "DEBIT": 0.0, "REFUND": 0.0})
+            if ty in agg[pid]:
+                agg[pid][ty] += float(r["total"] or 0)
+        updated = 0
+        for pid, s in agg.items():
+            credited = round(s["CREDIT"] + s["ADJUSTMENT"], 2)
+            debited  = round(s["DEBIT"], 2)
+            refunded = round(s["REFUND"], 2)
+            balance  = round(credited - debited - refunded, 2)
+            await db.patient_wallets.update_one(
+                {"patient_id": pid},
+                {"$set": {
+                    "current_balance": balance,
+                    "total_credited":  credited,
+                    "total_debited":   debited,
+                    "total_refunded":  refunded,
+                    "updated_at": now_iso(),
+                }},
+                upsert=False,
+            )
+            updated += 1
+        logger.info(f"Wallet balances recomputed from transactions for {updated} patients")
+        return {"recomputed": updated}
+    except Exception as e:
+        logger.warning(f"Wallet balance recompute failed: {e}")
+        return {"error": str(e)}
 
 # ────────────────────────────────────────────────────────────────────────────
 # AUTH
@@ -1875,6 +2007,24 @@ async def reset_database(body: Optional[Dict[str, Any]] = None, user=Depends(cur
 # ────────────────────────────────────────────────────────────────────────────
 # WALLET — patient prepaid balance, transactions, refund requests, reports
 # ────────────────────────────────────────────────────────────────────────────
+@api.post("/wallet/admin/recalculate")
+async def admin_recalculate_wallets(user=Depends(current_user)):
+    """Admin-only: rebuild wallet balances from the transaction ledger and
+    backfill any missing credits from historical Stopped/Converted/Cancelled
+    bookings. Safe & idempotent — run anytime balances look wrong."""
+    if not is_super_admin(user):
+        raise HTTPException(403, "Only Super Admin can recalculate wallets")
+    backfill = await backfill_wallets() or {}
+    recon    = await reconcile_wallet_credits_from_bookings() or {}
+    recompute = await recompute_wallet_balances_from_transactions() or {}
+    await audit(user, "wallet_recalculate", "wallet", None, None,
+                {"reconciliation": recon, "recompute": recompute})
+    return {
+        "message": "Wallet recalculation complete",
+        "reconciliation": recon,
+        "balance_recompute": recompute,
+    }
+
 @api.get("/wallet/dashboard-stats")
 async def wallet_dashboard_stats(user=Depends(current_user)):
     a = await db.patient_wallets.aggregate([{"$group":{"_id":None,"v":{"$sum":"$current_balance"}}}]).to_list(1)

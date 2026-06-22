@@ -1,0 +1,31 @@
+{
+  "summary": "Iteration 3 — Wallet self-heal/recovery verified end-to-end. Added 9 new pytest cases (TestWalletAdminRecalculate) on top of the existing 21 from iter-2. All 30/30 tests pass against the public preview backend. Covers: response-shape contract for POST /api/wallet/admin/recalculate, role-based 403 for manager/accountant/foe + 401/403 for unauth, back-to-back idempotency (2nd call created=0), the full recovery flow (stop booking 2 → simulate data loss via pymongo by deleting wallet_transactions for booking 2 and zeroing patient_wallets row → recalculate → verify GET /api/wallet/2 balance recovered + ledger tx recreated), and the dashboard total reconciliation. Also fixed a pre-existing flaky assertion in TestRefundRequests.test_create_refund_request_full_workflow (and a similar one in test_patch_refund_request_status_invalid_value) that picked a stale row from previous runs.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_wallet_module.py",
+    "/app/test_reports/pytest/wallet_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "reconcile_wallet_credits_from_bookings() correctly uses (patient_id, reference_id, transaction_type ∈ CREDIT/REFUND/ADJUSTMENT) as the idempotency key. Cap of consumed=paid prevents negative refundable. Verified empirically: 2nd back-to-back call always reports created=0.",
+    "recompute_wallet_balances_from_transactions() recomputes totals strictly from wallet_transactions and uses upsert=False (won't accidentally create wallet rows missing from patient_wallets). Combined with backfill_wallets() in on_start() this is correct.",
+    "admin_recalculate_wallets at server.py:2010 chains backfill→reconcile→recompute in the right order, returns both reconciliation and balance_recompute payloads, and writes an audit event — solid.",
+    "Permission gate is_super_admin (admin-only) on POST /wallet/admin/recalculate is correctly enforced; manager/accountant/foe all receive 403 even though they have read access to /wallet endpoints.",
+    "server.py is now 4401 lines — refactor into routers (wallet_router.py, bookings_router.py, …) is still pending tech-debt; not blocking.",
+    "Iter-2 test TestRefundRequests.test_create_refund_request_full_workflow had a latent picker bug (mine[-1] picked the oldest row when API returns newest-first across runs). Fixed by selecting by `rid` when known or `max(..., key=id)`. Same pattern was applied to test_patch_refund_request_status_invalid_value. Functional code is unaffected."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_wallet_module.py — added TestWalletAdminRecalculate (9 tests) and fixed 2 stale-row selectors in TestRefundRequests"
+  ],
+  "success_rate": {"backend": "100% (30/30)", "frontend": "not tested (skipped per request)"},
+  "test_credentials": "admin/Admin@1234, manager/Manager@1234, accountant/Account@1234, foe/Foe@1234 — all working via POST /api/login.",
+  "seed_data_creation": "E2E recovery test stops booking 2 (Brijesh Kumar) once per run if Active, then wipes & recalculates. Idempotent across runs. Earlier tests still credit patient 1 and create refund-requests; selectors now sort by max(id) so accumulated rows do not flake the suite.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Wallet module is fully green across iter-1, iter-2 and iter-3 (30/30 pytest). The recovery contract is locked down by TestWalletAdminRecalculate. To re-run: `pytest /app/backend/tests/test_wallet_module.py -v --junitxml=/app/test_reports/pytest/wallet_results.xml`. The E2E recovery test imports pymongo and reads MONGO_URL/DB_NAME directly from /app/backend/.env to simulate data loss; if those env vars are renamed, the test will pytest.skip rather than fail. Booking 2 belongs to patient_id 2 (Brijesh Kumar) — keep this mapping when changing seed data.",
+  "rca of the issue": "Render migration dropped the wallet_transactions ledger but kept patient_wallets rows zeroed and bookings table intact. Without the ledger, patient_wallets.current_balance had no source of truth → all wallets showed ₹0 even for patients with historical Stopped/Cancelled/Converted bookings that had been refunded into wallet. Fix introduces a 3-step self-heal that runs on startup AND on admin demand: backfill_wallets() guarantees every patient has a wallet row, reconcile_wallet_credits_from_bookings() inserts the missing CREDIT entries (idempotent on patient_id+reference_id+CREDIT/REFUND/ADJUSTMENT), recompute_wallet_balances_from_transactions() then rebuilds patient_wallets totals strictly from the ledger. Validated end-to-end by stopping booking 2 (Brijesh Kumar), wiping his wallet ledger row via pymongo, and verifying the recalculate endpoint restores both the CREDIT tx and the wallet balance (and that a second recalc is a no-op)."
+}
