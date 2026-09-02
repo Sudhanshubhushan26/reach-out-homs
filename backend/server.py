@@ -5,7 +5,7 @@ React frontend works unchanged.
 
 All routes are prefixed with `/api` to comply with the Kubernetes ingress.
 """
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File, Form, Header, Query
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File, Form, Header, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
@@ -59,11 +59,14 @@ def make_token(payload: dict) -> str:
     p = {**payload, "exp": datetime.now(timezone.utc) + timedelta(days=1)}
     return jwt.encode(p, JWT_SECRET, algorithm=JWT_ALG)
 
-async def current_user(authorization: Optional[str] = Header(None)):
+async def current_user(request: Request, authorization: Optional[str] = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "No token")
     try:
-        return jwt.decode(authorization.split(" ", 1)[1], JWT_SECRET, algorithms=[JWT_ALG])
+        payload = jwt.decode(authorization.split(" ", 1)[1], JWT_SECRET, algorithms=[JWT_ALG])
+        payload["ip"] = (request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+                         or (request.client.host if request.client else ""))
+        return payload
     except jwt.PyJWTError:
         raise HTTPException(401, "Invalid token")
 
@@ -71,11 +74,11 @@ async def current_user(authorization: Optional[str] = Header(None)):
 ROLES = ["admin", "manager", "supervisor", "accountant", "foe", "staff"]
 PERMS = {
     "admin": {"*"},
-    "manager": {"staff:read","staff:write","patient:read","patient:write","booking:*","payroll:read","payroll:write","report:*","analytics:*","compliance:*","refund:verify","refund:approve","roster:*","incident:*"},
-    "supervisor": {"staff:read","patient:read","booking:read","roster:read","roster:write","attendance:read","incident:read","incident:write","report:read"},
-    "accountant": {"bill:*","refund:verify","payroll:read","report:read","analytics:read"},
-    "foe": {"lead:*","patient:read","patient:write","booking:read","booking:write","refund:initiate"},
-    "staff":  {"self:*","attendance:write","chart:*","incident:write"},
+    "manager": {"staff:read","staff:write","patient:read","patient:write","booking:*","payroll:read","payroll:write","report:*","analytics:*","compliance:*","refund:verify","refund:approve","refund:read","refund:initiate","roster:*","incident:*","attendance:read","training:read","training:write","ambulance:read","ambulance:write","asset:read","asset:write","vendor:read","vendor:write","bill:read","bill:write","wallet:read","wallet:write","lead:read","lead:write","service:read","service:write","notification:read","notification:write","consent:read","consent:write","feedback:read","feedback:write","inventory:read","inventory:write","lending:read","lending:write","export:read","pdf:read","mcq:read","mcq:write","chart:read","chart:write"},
+    "supervisor": {"staff:read","patient:read","booking:read","roster:read","roster:write","attendance:read","incident:read","incident:write","report:read","training:read","training:write","chart:read","chart:write","consent:read","feedback:read","compliance:read"},
+    "accountant": {"bill:read","bill:write","refund:verify","refund:read","refund:initiate","payroll:read","payroll:write","report:read","analytics:read","wallet:read","wallet:write","vendor:read","asset:read","export:read","pdf:read","staff:read","lending:read","lending:write","inventory:read"},
+    "foe": {"lead:read","lead:write","patient:read","patient:write","booking:read","booking:write","refund:initiate","refund:read","chart:read","chart:write","incident:write","incident:read","consent:read","consent:write","feedback:read","feedback:write","ambulance:read","ambulance:write","service:read","notification:read","staff:read"},
+    "staff":  {"self:*","attendance:write","attendance:read","chart:read","chart:write","incident:write","incident:read","training:read","feedback:write"},
 }
 def has_perm(user_role: str, perm: str) -> bool:
     p = PERMS.get(user_role, set())
@@ -107,6 +110,7 @@ async def audit(user, action: str, target_type: str, target_id=None, before=None
         await db.audit_logs.insert_one({
             "id": await next_id("audit_logs"),
             "user_id": user.get("id"), "user_name": user.get("name"), "user_role": user.get("role"),
+            "ip_address": user.get("ip", ""),
             "action": action, "target_type": target_type, "target_id": target_id,
             "before": _sanitize(before), "after": _sanitize(after), "notes": notes,
             "created_at": now_iso(),
@@ -310,14 +314,24 @@ async def seed():
             ("RO010","Rajesh Pandey","Helper","GDA","HealthLink","Available",4.1,"9876541010","Laxmi Nagar, Delhi","8th Pass","2 years","Contractual","11000"),
         ]
         for code,name,role,cat,vendor,duty,rating,mob,addr,qual,exp,emp_type,sal in staff_seed:
+            staff_email = f"{code.lower()}@reachout.in"
             await db.staff.insert_one({
                 "id": await next_id("staff"), "code": code, "name": name, "role": role,
                 "category": cat, "vendor": vendor, "duty_tag": duty, "status": "Active",
                 "rating": rating, "mobile": mob, "address": addr, "qualification": qual,
                 "experience": exp, "employment_type": emp_type, "salary": sal,
+                "email": staff_email,
                 "joining_date": (dt_date.today() - timedelta(days=random.randint(60, 730))).isoformat(),
                 "photo": "", "created_at": now_iso(),
             })
+            # Create user account with Temp@1234 for staff login (force change on first login)
+            if not await db.users.find_one({"username": staff_email}):
+                await db.users.insert_one({
+                    "id": await next_id("users"), "username": staff_email, "name": name,
+                    "role": "staff", "password": pwd_ctx.hash("Temp@1234"),
+                    "must_change_password": True, "status": "Active",
+                    "email": staff_email, "created_at": now_iso(),
+                })
     if not await db.patients.find_one({"reg_number": "RO-PAT-001"}):
         pseed = [
             ("RO-PAT-001","SGRH-10234","Nitin Gupta","58","Male","9811001001","C-14, Sector 8, Rohini, Delhi","SGRH","Post-operative rehabilitation after CABG","Dr. Suresh Mehta","Home","Internal Home","A+","Aspirin, Atorvastatin","Diabetes, Hypertension"),
@@ -397,11 +411,48 @@ async def seed():
 @app.on_event("startup")
 async def on_start():
     await seed()
+    await backfill_staff_emails()
+    await backfill_staff_users()
     await backfill_wallets()
     await reconcile_wallet_credits_from_bookings()
     await reconcile_wallet_credits_from_bills()
     await recompute_wallet_balances_from_transactions()
     logger.info("Reach Out HOMS backend started")
+
+
+async def backfill_staff_emails():
+    """Idempotent: add email field to existing staff records that lack one."""
+    try:
+        updated = 0
+        async for s in db.staff.find({"email": {"$in": [None, ""]}}, {"_id": 0}):
+            email = f"{s['code'].lower()}@reachout.in"
+            await db.staff.update_one({"id": s["id"]}, {"$set": {"email": email}})
+            updated += 1
+        if updated:
+            logger.info(f"Staff email backfill: added email to {updated} staff records")
+    except Exception as e:
+        logger.warning(f"Staff email backfill failed: {e}")
+
+
+async def backfill_staff_users():
+    """Idempotent: create user accounts (Temp@1234) for staff that lack one."""
+    try:
+        created = 0
+        async for s in db.staff.find({}, {"_id": 0, "code": 1, "name": 1, "id": 1, "email": 1}):
+            email = s.get("email") or f"{s['code'].lower()}@reachout.in"
+            if not await db.users.find_one({"username": email}):
+                await db.users.insert_one({
+                    "id": await next_id("users"), "username": email,
+                    "name": s.get("name", s["code"]), "role": "staff",
+                    "password": pwd_ctx.hash("Temp@1234"),
+                    "must_change_password": True, "status": "Active",
+                    "staff_id": s["id"], "email": email, "created_at": now_iso(),
+                })
+                created += 1
+        if created:
+            logger.info(f"Staff user backfill: created {created} staff login accounts")
+    except Exception as e:
+        logger.warning(f"Staff user backfill failed: {e}")
 
 
 async def backfill_wallets():
@@ -643,8 +694,35 @@ async def login(body: Dict[str, Any]):
     if not u: raise HTTPException(401, "User not found")
     if not pwd_ctx.verify(body.get("password", ""), u["password"]):
         raise HTTPException(401, "Invalid password")
+    # Force password change on first login (Temp@1234 or must_change_password flag)
+    if u.get("must_change_password") or pwd_ctx.verify("Temp@1234", u["password"]):
+        temp_token = make_token({"id": u["id"], "role": u["role"], "name": u["name"], "must_change": True})
+        return {"success": True, "must_change_password": True, "token": temp_token, "name": u["name"], "role": u["role"]}
     token = make_token({"id": u["id"], "role": u["role"], "name": u["name"]})
     return {"success": True, "role": u["role"], "name": u["name"], "token": token}
+
+
+@api.post("/force-change-password")
+async def force_change_password(body: Dict[str, Any], user=Depends(current_user)):
+    """First-login forced password change. Token must have must_change=True."""
+    if not user.get("must_change"):
+        raise HTTPException(400, "Password change not required")
+    new = (body.get("new_password") or "").strip()
+    if len(new) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters")
+    has_letter = any(c.isalpha() for c in new)
+    has_other = any((not c.isalpha()) for c in new)
+    if not (has_letter and has_other):
+        raise HTTPException(400, "Password must contain both letters and a number/symbol")
+    await db.users.update_one({"id": user.get("id")}, {"$set": {
+        "password": pwd_ctx.hash(new),
+        "must_change_password": False,
+        "password_updated_at": now_iso(),
+    }})
+    u = await db.users.find_one({"id": user.get("id")}, {"_id": 0, "password": 0})
+    token = make_token({"id": u["id"], "role": u["role"], "name": u["name"]})
+    await audit(user, "force_change_password", "user", u["id"])
+    return {"success": True, "message": "Password changed successfully", "token": token, "role": u["role"], "name": u["name"]}
 
 
 @api.post("/change-password")
@@ -725,7 +803,7 @@ async def list_col(col, q=None, sort=("id", -1), limit=2000):
 @api.get("/staff")
 async def list_staff(role: Optional[str]=None, vendor: Optional[str]=None, status: Optional[str]=None,
                      duty_tag: Optional[str]=None, category: Optional[str]=None, search: Optional[str]=None,
-                     user=Depends(current_user)):
+                     user=Depends(require("staff:read"))):
     q = {}
     for k, v in [("role", role), ("vendor", vendor), ("status", status), ("duty_tag", duty_tag), ("category", category)]:
         if v: q[k] = v
@@ -738,7 +816,7 @@ async def list_staff(role: Optional[str]=None, vendor: Optional[str]=None, statu
     return rows
 
 @api.get("/staff/available")
-async def staff_available(date: Optional[str]=None, shift: Optional[str]=None, role: Optional[str]=None, vendor: Optional[str]=None, user=Depends(current_user)):
+async def staff_available(date: Optional[str]=None, shift: Optional[str]=None, role: Optional[str]=None, vendor: Optional[str]=None, user=Depends(require("staff:read"))):
     check_date = date or today()
     q = {"status": "Active", "duty_tag": {"$nin": ["Suspended","Terminated"]}}
     if role: q["role"] = role
@@ -757,13 +835,16 @@ async def staff_available(date: Optional[str]=None, shift: Optional[str]=None, r
     return rows
 
 @api.get("/staff/{sid}")
-async def get_staff(sid: int, user=Depends(current_user)):
+async def get_staff(sid: int, user=Depends(require("staff:read"))):
     r = await db.staff.find_one({"id": sid}, {"_id": 0})
     if not r: raise HTTPException(404, "Not found")
     return r
 
 @api.post("/staff")
-async def create_staff(d: Dict[str, Any], user=Depends(current_user)):
+async def create_staff(d: Dict[str, Any], user=Depends(require("staff:write"))):
+    email = (d.get("email") or "").strip()
+    if not email:
+        raise HTTPException(400, "Email is required for staff onboarding")
     last = await db.staff.find({"code": {"$regex": "^RO"}}).sort("code", -1).limit(1).to_list(1)
     nxt = 1
     if last:
@@ -772,23 +853,33 @@ async def create_staff(d: Dict[str, Any], user=Depends(current_user)):
     code = f"RO{nxt:03d}"
     sid = await next_id("staff")
     doc = {"id": sid, "code": code, "status": d.get("status","Active"), "duty_tag": d.get("duty_tag","Available"),
-           "rating": 0, "photo": "", "created_at": now_iso(), **{k: v for k, v in d.items() if k not in ("id","code")}}
+           "rating": 0, "photo": "", "email": email, "created_at": now_iso(), **{k: v for k, v in d.items() if k not in ("id","code")}}
     await db.staff.insert_one(doc)
-    return {"id": sid, "code": code, "message": "Staff Created"}
+    # Create user account with Temp@1234 for staff login (force change on first login)
+    if not await db.users.find_one({"username": email}):
+        uid = await next_id("users")
+        await db.users.insert_one({
+            "id": uid, "username": email, "name": d.get("name", code),
+            "role": "staff", "password": pwd_ctx.hash("Temp@1234"),
+            "must_change_password": True, "status": "Active",
+            "staff_id": sid, "email": email, "created_at": now_iso(),
+        })
+    await audit(user, "create", "staff", sid, after={"code": code, "name": d.get("name"), "email": email})
+    return {"id": sid, "code": code, "message": "Staff Created. Login credentials sent to " + email}
 
 @api.put("/staff/{sid}")
-async def update_staff(sid: int, d: Dict[str, Any], user=Depends(current_user)):
+async def update_staff(sid: int, d: Dict[str, Any], user=Depends(require("staff:write"))):
     d.pop("id", None); d.pop("_id", None)
     await db.staff.update_one({"id": sid}, {"$set": d})
     return {"message": "Staff Updated"}
 
 @api.delete("/staff/{sid}")
-async def del_staff(sid: int, user=Depends(current_user)):
+async def del_staff(sid: int, user=Depends(require("staff:write"))):
     await db.staff.delete_one({"id": sid})
     return {"message": "Staff Deleted"}
 
 @api.patch("/staff/{sid}/duty-tag")
-async def patch_duty(sid: int, body: Dict[str, Any], user=Depends(current_user)):
+async def patch_duty(sid: int, body: Dict[str, Any], user=Depends(require("staff:write"))):
     await db.staff.update_one({"id": sid}, {"$set": {"duty_tag": body.get("duty_tag")}})
     return {"message": "Duty tag updated"}
 
@@ -818,7 +909,7 @@ async def upload_staff_doc(sid: int, document: UploadFile = File(...),
     return {"message": "Document uploaded"}
 
 @api.get("/staff/{sid}/documents")
-async def list_staff_docs(sid: int, user=Depends(current_user)):
+async def list_staff_docs(sid: int, user=Depends(require("staff:read"))):
     return await list_col("staff_documents", {"staff_id": sid})
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -844,7 +935,7 @@ async def att_login(staff_id: int = Form(...), lat: str = Form(""), lng: str = F
     return {"message": "Logged in"}
 
 @api.post("/attendance/logout")
-async def att_logout(body: Dict[str, Any], user=Depends(current_user)):
+async def att_logout(body: Dict[str, Any], user=Depends(require("attendance:write"))):
     sid = body.get("staff_id"); d = today()
     rec = await db.attendance.find_one({"staff_id": sid, "date": d, "logout_time": None})
     if not rec:
@@ -859,7 +950,7 @@ async def att_logout(body: Dict[str, Any], user=Depends(current_user)):
 @api.get("/attendance")
 async def list_attendance(staff_id: Optional[int]=None, date: Optional[str]=None,
                           frm: Optional[str]=Query(None, alias="from"), to: Optional[str]=None,
-                          vendor: Optional[str]=None, user=Depends(current_user)):
+                          vendor: Optional[str]=None, user=Depends(require("attendance:read"))):
     q = {}
     if staff_id: q["staff_id"] = staff_id
     if date: q["date"] = date
@@ -878,7 +969,7 @@ async def list_attendance(staff_id: Optional[int]=None, date: Optional[str]=None
 # RATINGS / TRAINING / INCIDENTS
 # ────────────────────────────────────────────────────────────────────────────
 @api.post("/staff/{sid}/ratings")
-async def add_rating(sid: int, body: Dict[str, Any], user=Depends(current_user)):
+async def add_rating(sid: int, body: Dict[str, Any], user=Depends(require("staff:write"))):
     await db.staff_ratings.insert_one({"id": await next_id("staff_ratings"), "staff_id": sid,
         "patient_id": body.get("patient_id"), "source": body.get("source"),
         "score": body.get("score"), "comment": body.get("comment"), "rated_at": now_iso()})
@@ -887,11 +978,11 @@ async def add_rating(sid: int, body: Dict[str, Any], user=Depends(current_user))
     return {"message": "Rating submitted", "weighted_rating": new_rating}
 
 @api.get("/staff/{sid}/ratings")
-async def get_ratings(sid: int, user=Depends(current_user)):
+async def get_ratings(sid: int, user=Depends(require("staff:read"))):
     return await list_col("staff_ratings", {"staff_id": sid}, sort=("rated_at", -1))
 
 @api.get("/training")
-async def list_training(staff_id: Optional[int]=None, user=Depends(current_user)):
+async def list_training(staff_id: Optional[int]=None, user=Depends(require("training:read"))):
     q = {"staff_id": staff_id} if staff_id else {}
     rows = await list_col("training", q, sort=("date", -1))
     smap = {s["id"]: s for s in await list_col("staff")}
@@ -899,26 +990,26 @@ async def list_training(staff_id: Optional[int]=None, user=Depends(current_user)
     return rows
 
 @api.post("/training")
-async def add_training(body: Dict[str, Any], user=Depends(current_user)):
+async def add_training(body: Dict[str, Any], user=Depends(require("training:write"))):
     tid = await next_id("training")
     await db.training.insert_one({"id": tid, **body, "created_at": now_iso()})
     return {"id": tid, "message": "Training logged"}
 
 @api.get("/incidents")
-async def list_incidents(user=Depends(current_user)):
+async def list_incidents(user=Depends(require("incident:read"))):
     rows = await list_col("incidents", sort=("id", -1))
     smap = {s["id"]: s for s in await list_col("staff")}
     for r in rows: r["staff_name"] = smap.get(r.get("staff_id"), {}).get("name")
     return rows
 
 @api.post("/incidents")
-async def add_incident(body: Dict[str, Any], user=Depends(current_user)):
+async def add_incident(body: Dict[str, Any], user=Depends(require("incident:write"))):
     iid = await next_id("incidents")
     await db.incidents.insert_one({"id": iid, **body, "status": "Open", "reported_at": now_iso()})
     return {"id": iid, "message": "Incident reported"}
 
 @api.put("/incidents/{iid}")
-async def upd_incident(iid: int, body: Dict[str, Any], user=Depends(current_user)):
+async def upd_incident(iid: int, body: Dict[str, Any], user=Depends(require("incident:write"))):
     await db.incidents.update_one({"id": iid}, {"$set": body})
     return {"message": "Incident updated"}
 
@@ -927,7 +1018,7 @@ async def upd_incident(iid: int, body: Dict[str, Any], user=Depends(current_user
 # ────────────────────────────────────────────────────────────────────────────
 @api.get("/patients")
 async def list_patients(status: Optional[str]=None, service_location: Optional[str]=None,
-                        category: Optional[str]=None, search: Optional[str]=None, user=Depends(current_user)):
+                        category: Optional[str]=None, search: Optional[str]=None, user=Depends(require("patient:read"))):
     q = {}
     if status: q["status"] = status
     if service_location: q["service_location"] = service_location
@@ -937,13 +1028,13 @@ async def list_patients(status: Optional[str]=None, service_location: Optional[s
     return await list_col("patients", q)
 
 @api.get("/patients/{pid}")
-async def get_patient(pid: int, user=Depends(current_user)):
+async def get_patient(pid: int, user=Depends(require("patient:read"))):
     r = await db.patients.find_one({"id": pid}, {"_id": 0})
     if not r: raise HTTPException(404, "Not found")
     return r
 
 @api.post("/patients")
-async def create_patient(d: Dict[str, Any], user=Depends(current_user)):
+async def create_patient(d: Dict[str, Any], user=Depends(require("patient:write"))):
     cnt = await db.patients.count_documents({})
     reg = f"RO-PAT-{cnt+1:04d}"
     pid = await next_id("patients")
@@ -960,7 +1051,7 @@ async def create_patient(d: Dict[str, Any], user=Depends(current_user)):
     return {"id": pid, "reg_number": reg, "message": "Patient Registered"}
 
 @api.put("/patients/{pid}")
-async def update_patient(pid: int, d: Dict[str, Any], user=Depends(current_user)):
+async def update_patient(pid: int, d: Dict[str, Any], user=Depends(require("patient:write"))):
     cur = await db.patients.find_one({"id": pid})
     if cur and cur.get("frozen") and user.get("role") != "admin":
         raise HTTPException(403, "Patient details are frozen. Only admin can edit.")
@@ -969,7 +1060,7 @@ async def update_patient(pid: int, d: Dict[str, Any], user=Depends(current_user)
     return {"message": "Patient Updated"}
 
 @api.patch("/patients/{pid}/freeze")
-async def freeze_patient(pid: int, body: Dict[str, Any], user=Depends(current_user)):
+async def freeze_patient(pid: int, body: Dict[str, Any], user=Depends(require("patient:write"))):
     if user.get("role") != "admin":
         raise HTTPException(403, "Only Admin can freeze/unfreeze patient records")
     frozen = 1 if body.get("frozen") else 0
@@ -981,7 +1072,7 @@ async def freeze_patient(pid: int, body: Dict[str, Any], user=Depends(current_us
     return {"message": f"Patient {action.lower()} successfully"}
 
 @api.get("/patients/{pid}/freeze-log")
-async def freeze_log(pid: int, user=Depends(current_user)):
+async def freeze_log(pid: int, user=Depends(require("patient:read"))):
     return await list_col("patient_freeze_log", {"patient_id": pid})
 
 @api.post("/patients/{pid}/photo")
@@ -1005,14 +1096,14 @@ async def upload_patient_doc(pid: int, document: UploadFile = File(...), documen
     return {"message": "Document uploaded"}
 
 @api.get("/patients/{pid}/documents")
-async def list_patient_docs(pid: int, user=Depends(current_user)):
+async def list_patient_docs(pid: int, user=Depends(require("patient:read"))):
     return await list_col("patient_documents", {"patient_id": pid})
 
 # ────────────────────────────────────────────────────────────────────────────
 # LEADS
 # ────────────────────────────────────────────────────────────────────────────
 @api.get("/leads")
-async def list_leads(status: Optional[str]=None, search: Optional[str]=None, user=Depends(current_user)):
+async def list_leads(status: Optional[str]=None, search: Optional[str]=None, user=Depends(require("lead:read"))):
     q = {}
     if status: q["status"] = status
     if search:
@@ -1020,13 +1111,13 @@ async def list_leads(status: Optional[str]=None, search: Optional[str]=None, use
     return await list_col("leads", q)
 
 @api.post("/leads")
-async def add_lead(d: Dict[str, Any], user=Depends(current_user)):
+async def add_lead(d: Dict[str, Any], user=Depends(require("lead:write"))):
     lid = await next_id("leads")
     await db.leads.insert_one({"id": lid, "status": d.get("status","New"), "created_at": now_iso(), **d})
     return {"id": lid, "message": "Lead created"}
 
 @api.put("/leads/{lid}")
-async def upd_lead(lid: int, d: Dict[str, Any], user=Depends(current_user)):
+async def upd_lead(lid: int, d: Dict[str, Any], user=Depends(require("lead:write"))):
     d.pop("id", None); d.pop("_id", None)
     await db.leads.update_one({"id": lid}, {"$set": d})
     return {"message": "Lead updated"}
@@ -1038,7 +1129,7 @@ async def upd_lead(lid: int, d: Dict[str, Any], user=Depends(current_user)):
 async def list_bookings(patient_id: Optional[int]=None, staff_id: Optional[int]=None,
                         status: Optional[str]=None, service_category: Optional[str]=None,
                         frm: Optional[str]=Query(None, alias="from"), to: Optional[str]=None,
-                        search: Optional[str]=None, user=Depends(current_user)):
+                        search: Optional[str]=None, user=Depends(require("booking:read"))):
     q = {}
     if patient_id: q["patient_id"] = patient_id
     if staff_id: q["staff_id"] = staff_id
@@ -1059,7 +1150,7 @@ async def list_bookings(patient_id: Optional[int]=None, staff_id: Optional[int]=
     return rows
 
 @api.post("/bookings")
-async def add_booking(d: Dict[str, Any], user=Depends(current_user)):
+async def add_booking(d: Dict[str, Any], user=Depends(require("booking:write"))):
     now = datetime.now()
     today_iso = today()
 
@@ -1161,7 +1252,7 @@ async def add_booking(d: Dict[str, Any], user=Depends(current_user)):
             "amount": amount, "wallet_used": wallet_amount}
 
 @api.put("/bookings/{bid}")
-async def upd_booking(bid: int, d: Dict[str, Any], user=Depends(current_user)):
+async def upd_booking(bid: int, d: Dict[str, Any], user=Depends(require("booking:write"))):
     # Coordinator cannot edit existing services
     if not is_manager_or_admin(user):
         raise HTTPException(403, "Only Super Admin or Manager can edit a booking")
@@ -1204,7 +1295,7 @@ async def upd_booking(bid: int, d: Dict[str, Any], user=Depends(current_user)):
     return {"message": "Booking updated"}
 
 @api.post("/bookings/{bid}/reassign")
-async def reassign_booking(bid: int, body: Dict[str, Any], user=Depends(current_user)):
+async def reassign_booking(bid: int, body: Dict[str, Any], user=Depends(require("booking:write"))):
     cur = await db.bookings.find_one({"id": bid})
     notes = (cur.get("notes","") if cur else "") + f" | Reassigned: {body.get('reason','')}"
     await db.bookings.update_one({"id": bid}, {"$set": {"staff_id": body.get("staff_id"), "notes": notes}})
@@ -1216,7 +1307,7 @@ async def reassign_booking(bid: int, body: Dict[str, Any], user=Depends(current_
 @api.get("/bills")
 async def list_bills(patient_id: Optional[int]=None, payment_status: Optional[str]=None,
                      frm: Optional[str]=Query(None, alias="from"), to: Optional[str]=None,
-                     search: Optional[str]=None, user=Depends(current_user)):
+                     search: Optional[str]=None, user=Depends(require("bill:read"))):
     q = {}
     if patient_id: q["patient_id"] = patient_id
     if payment_status: q["payment_status"] = payment_status
@@ -1235,7 +1326,7 @@ async def list_bills(patient_id: Optional[int]=None, payment_status: Optional[st
     return rows
 
 @api.post("/bills")
-async def create_bill(body: Dict[str, Any], user=Depends(current_user)):
+async def create_bill(body: Dict[str, Any], user=Depends(require("bill:write"))):
     """
     Create a bill with itemized line_items from the service catalog.
     Body: {
@@ -1339,7 +1430,7 @@ async def create_bill(body: Dict[str, Any], user=Depends(current_user)):
     return {"id": bid_int, "receipt_number": rcpt_num, "total_amount": total, "balance": total - paid, "message": "Bill created"}
 
 @api.post("/bills/{bid}/pay")
-async def pay_bill(bid: int, body: Dict[str, Any], user=Depends(current_user)):
+async def pay_bill(bid: int, body: Dict[str, Any], user=Depends(require("bill:write"))):
     b = await db.bills.find_one({"id": bid})
     if not b: raise HTTPException(404, "Not found")
     add_paid = float(body.get("amount") or 0)
@@ -1386,7 +1477,7 @@ async def pay_bill(bid: int, body: Dict[str, Any], user=Depends(current_user)):
 
 @api.get("/refunds")
 async def list_refunds(status: Optional[str]=None, search: Optional[str]=None,
-                       user=Depends(current_user)):
+                       user=Depends(require("refund:read"))):
     q = {"status": status} if status else {}
     rows = await list_col("refunds", q, sort=("id", -1))
     if search:
@@ -1401,7 +1492,7 @@ async def list_refunds(status: Optional[str]=None, search: Optional[str]=None,
     return rows
 
 @api.post("/refunds")
-async def add_refund(d: Dict[str, Any], user=Depends(current_user)):
+async def add_refund(d: Dict[str, Any], user=Depends(require("refund:initiate"))):
     if not has_perm(user.get("role",""), "refund:initiate"):
         raise HTTPException(403, "Forbidden")
     rid = await next_id("refunds")
@@ -1426,7 +1517,7 @@ async def add_refund(d: Dict[str, Any], user=Depends(current_user)):
     return {"id": rid, "message": "Refund initiated"}
 
 @api.post("/refunds/{rid}/upload-doc")
-async def upload_refund_doc(rid: int, document: UploadFile = File(...), doc_type: str = Form("id_proof"), user=Depends(current_user)):
+async def upload_refund_doc(rid: int, document: UploadFile = File(...), doc_type: str = Form("id_proof"), user=Depends(require("refund:initiate"))):
     path = UPLOAD_DIR / "patients" / f"refund-{doc_type}-{rid}-{int(datetime.now().timestamp()*1000)}-{document.filename}"
     path.write_bytes(await document.read())
     field = "id_proof_path" if doc_type == "id_proof" else "cancelled_cheque_path"
@@ -1435,7 +1526,7 @@ async def upload_refund_doc(rid: int, document: UploadFile = File(...), doc_type
     return {"message": "Refund document uploaded"}
 
 @api.patch("/refunds/{rid}/approve")
-async def approve_refund(rid: int, body: Dict[str, Any], user=Depends(current_user)):
+async def approve_refund(rid: int, body: Dict[str, Any], user=Depends(require("refund:approve"))):
     level = body.get("level"); name = user.get("name","Admin"); role = user.get("role","")
     if level == "verify":
         if not has_perm(role, "refund:verify"): raise HTTPException(403, "Forbidden")
@@ -1457,14 +1548,14 @@ async def approve_refund(rid: int, body: Dict[str, Any], user=Depends(current_us
 @api.get("/ambulance")
 async def list_amb(status: Optional[str]=None, call_type: Optional[str]=None,
                    frm: Optional[str]=Query(None, alias="from"), to: Optional[str]=None,
-                   user=Depends(current_user)):
+                   user=Depends(require("ambulance:read"))):
     q = {}
     if status: q["status"] = status
     if call_type: q["call_type"] = call_type
     return await list_col("ambulance_calls", q)
 
 @api.post("/ambulance")
-async def add_amb(d: Dict[str, Any], user=Depends(current_user)):
+async def add_amb(d: Dict[str, Any], user=Depends(require("ambulance:write"))):
     cid = await next_id("ambulance_calls")
     cn = f"AMB-{int(datetime.now().timestamp())}"
     await db.ambulance_calls.insert_one({"id": cid, "call_number": cn, "status":"Received",
@@ -1473,7 +1564,7 @@ async def add_amb(d: Dict[str, Any], user=Depends(current_user)):
     return {"id": cid, "call_number": cn, "message": "Call logged"}
 
 @api.patch("/ambulance/{cid}")
-async def upd_amb(cid: int, d: Dict[str, Any], user=Depends(current_user)):
+async def upd_amb(cid: int, d: Dict[str, Any], user=Depends(require("ambulance:write"))):
     d.pop("id", None); d.pop("_id", None)
     await db.ambulance_calls.update_one({"id": cid}, {"$set": d})
     return {"message": "Updated"}
@@ -1482,10 +1573,10 @@ async def upd_amb(cid: int, d: Dict[str, Any], user=Depends(current_user)):
 # ASSETS / VENDORS
 # ────────────────────────────────────────────────────────────────────────────
 @api.get("/assets")
-async def list_assets(user=Depends(current_user)): return await list_col("assets")
+async def list_assets(user=Depends(require("asset:read"))): return await list_col("assets")
 
 @api.post("/assets")
-async def add_asset(d: Dict[str, Any], user=Depends(current_user)):
+async def add_asset(d: Dict[str, Any], user=Depends(require("asset:write"))):
     aid = await next_id("assets")
     code = f"AST-{int(datetime.now().timestamp())}"
     await db.assets.insert_one({"id": aid, "asset_code": code, "status": d.get("status","Active"),
@@ -1493,23 +1584,23 @@ async def add_asset(d: Dict[str, Any], user=Depends(current_user)):
     return {"id": aid, "asset_code": code, "message": "Asset added"}
 
 @api.get("/vendors")
-async def list_vendors(user=Depends(current_user)):
+async def list_vendors(user=Depends(require("vendor:read"))):
     return await list_col("vendors", sort=("name", 1))
 
 @api.post("/vendors")
-async def add_vendor(d: Dict[str, Any], user=Depends(current_user)):
+async def add_vendor(d: Dict[str, Any], user=Depends(require("vendor:write"))):
     vid = await next_id("vendors")
     await db.vendors.insert_one({"id": vid, "status":"Active", "created_at": now_iso(), **d})
     return {"id": vid, "message": "Vendor added"}
 
 @api.put("/vendors/{vid}")
-async def upd_vendor(vid: int, d: Dict[str, Any], user=Depends(current_user)):
+async def upd_vendor(vid: int, d: Dict[str, Any], user=Depends(require("vendor:write"))):
     d.pop("id", None); d.pop("_id", None)
     await db.vendors.update_one({"id": vid}, {"$set": d})
     return {"message": "Vendor updated"}
 
 @api.delete("/vendors/{vid}")
-async def del_vendor(vid: int, user=Depends(current_user)):
+async def del_vendor(vid: int, user=Depends(require("vendor:write"))):
     await db.vendors.delete_one({"id": vid})
     return {"message": "Vendor deleted"}
 
@@ -1520,7 +1611,7 @@ async def del_vendor(vid: int, user=Depends(current_user)):
 async def list_roster(date: Optional[str]=None, frm: Optional[str]=Query(None, alias="from"),
                       to: Optional[str]=None, staff_id: Optional[int]=None,
                       vendor: Optional[str]=None, shift: Optional[str]=None,
-                      user=Depends(current_user)):
+                      user=Depends(require("roster:read"))):
     q = {}
     if date: q["date"] = date
     if frm: q["date"] = {"$gte": frm}
@@ -1539,7 +1630,7 @@ async def list_roster(date: Optional[str]=None, frm: Optional[str]=Query(None, a
 
 @api.get("/roster/available-staff")
 async def roster_avail(date: str, shift: Optional[str]=None, role: Optional[str]=None,
-                       vendor: Optional[str]=None, user=Depends(current_user)):
+                       vendor: Optional[str]=None, user=Depends(require("roster:read"))):
     # staff not rostered for this date+shift, active, not on leave
     rostered = await db.roster.find({"date": date, **({"shift":shift} if shift else {})}, {"staff_id":1}).to_list(2000)
     excluded = [r["staff_id"] for r in rostered]
@@ -1554,7 +1645,7 @@ async def roster_avail(date: str, shift: Optional[str]=None, role: Optional[str]
     return rows
 
 @api.post("/roster")
-async def add_roster(d: Dict[str, Any], user=Depends(current_user)):
+async def add_roster(d: Dict[str, Any], user=Depends(require("roster:write"))):
     if not (d.get("staff_id") and d.get("date") and d.get("shift")):
         raise HTTPException(400, "staff_id, date and shift are required")
     if await db.roster.find_one({"staff_id": d["staff_id"], "date": d["date"], "shift": d["shift"]}):
@@ -1566,19 +1657,19 @@ async def add_roster(d: Dict[str, Any], user=Depends(current_user)):
     return {"id": rid, "message": "Roster entry added"}
 
 @api.put("/roster/{rid}")
-async def upd_roster(rid: int, d: Dict[str, Any], user=Depends(current_user)):
+async def upd_roster(rid: int, d: Dict[str, Any], user=Depends(require("roster:write"))):
     d.pop("id", None); d.pop("_id", None)
     await db.roster.update_one({"id": rid}, {"$set": d})
     return {"message": "Roster updated"}
 
 @api.delete("/roster/{rid}")
-async def del_roster(rid: int, user=Depends(current_user)):
+async def del_roster(rid: int, user=Depends(require("roster:write"))):
     await db.roster.delete_one({"id": rid})
     return {"message": "Roster entry removed"}
 
 @api.get("/roster/summary")
 async def roster_summary(frm: Optional[str]=Query(None, alias="from"), to: Optional[str]=None,
-                         user=Depends(current_user)):
+                         user=Depends(require("roster:read"))):
     match = {}
     if frm: match["date"] = {"$gte": frm}
     if to: match.setdefault("date", {})["$lte"] = to
@@ -1598,7 +1689,7 @@ async def roster_summary(frm: Optional[str]=Query(None, alias="from"), to: Optio
 # MEDICAL CHARTS
 # ────────────────────────────────────────────────────────────────────────────
 @api.post("/medical-charts")
-async def add_chart(d: Dict[str, Any], user=Depends(current_user)):
+async def add_chart(d: Dict[str, Any], user=Depends(require("chart:write"))):
     cid = await next_id("medical_charts")
     data = d.get("chart_data")
     if isinstance(data, dict): data = json.dumps(data)
@@ -1611,7 +1702,7 @@ async def add_chart(d: Dict[str, Any], user=Depends(current_user)):
 @api.get("/medical-charts")
 async def list_charts(patient_id: Optional[int]=None, booking_id: Optional[str]=None,
                       chart_type: Optional[str]=None, frm: Optional[str]=Query(None, alias="from"),
-                      to: Optional[str]=None, user=Depends(current_user)):
+                      to: Optional[str]=None, user=Depends(require("chart:read"))):
     q = {}
     if patient_id: q["patient_id"] = patient_id
     if booking_id: q["booking_id"] = booking_id
@@ -1629,7 +1720,7 @@ async def list_charts(patient_id: Optional[int]=None, booking_id: Optional[str]=
     return rows
 
 @api.get("/medical-charts/trends/{pid}")
-async def chart_trends(pid: int, user=Depends(current_user)):
+async def chart_trends(pid: int, user=Depends(require("chart:read"))):
     rows = await db.medical_charts.find({"patient_id": pid}, {"_id":0}).sort("visit_date", 1).limit(90).to_list(90)
     out: Dict[str, List] = {}
     for r in rows:
@@ -1639,7 +1730,7 @@ async def chart_trends(pid: int, user=Depends(current_user)):
     return out
 
 @api.get("/medical-charts/latest-vitals")
-async def latest_vitals(user=Depends(current_user)):
+async def latest_vitals(user=Depends(require("chart:read"))):
     pipe = [{"$match":{"chart_type":"vitals"}},
             {"$sort":{"id":-1}},
             {"$group":{"_id":"$patient_id","doc":{"$first":"$$ROOT"}}},
@@ -1659,7 +1750,7 @@ async def latest_vitals(user=Depends(current_user)):
 # ANALYTICS
 # ────────────────────────────────────────────────────────────────────────────
 @api.get("/analytics/monthly-revenue")
-async def monthly_rev(user=Depends(current_user)):
+async def monthly_rev(user=Depends(require("analytics:read"))):
     pipe = [{"$group":{"_id":{"$substr":["$date",0,7]},
                        "revenue":{"$sum":"$paid_amount"},
                        "billed":{"$sum":"$amount"}, "count":{"$sum":1}}},
@@ -1668,14 +1759,14 @@ async def monthly_rev(user=Depends(current_user)):
             for r in await db.bills.aggregate(pipe).to_list(12)]
 
 @api.get("/analytics/service-demand")
-async def svc_demand(user=Depends(current_user)):
+async def svc_demand(user=Depends(require("analytics:read"))):
     pipe = [{"$group":{"_id":{"service_name":"$service_name","service_category":"$service_category"},
                        "count":{"$sum":1}}},{"$sort":{"count":-1}}]
     return [{"service_name":r["_id"]["service_name"],"service_category":r["_id"]["service_category"],"count":r["count"]}
             for r in await db.bookings.aggregate(pipe).to_list(200)]
 
 @api.get("/analytics/staff-performance")
-async def staff_perf(user=Depends(current_user)):
+async def staff_perf(user=Depends(require("analytics:read"))):
     out = []
     async for s in db.staff.find({}, {"_id":0}):
         bookings = await db.bookings.count_documents({"staff_id": s["id"]})
@@ -1688,14 +1779,14 @@ async def staff_perf(user=Depends(current_user)):
     return out
 
 @api.get("/analytics/patient-categories")
-async def pat_cat(user=Depends(current_user)):
+async def pat_cat(user=Depends(require("analytics:read"))):
     pipe = [{"$match":{"status":"Active"}},
             {"$group":{"_id":{"service_location":"$service_location","category":"$category"},"count":{"$sum":1}}}]
     return [{"service_location":r["_id"]["service_location"],"category":r["_id"]["category"],"count":r["count"]}
             for r in await db.patients.aggregate(pipe).to_list(200)]
 
 @api.get("/analytics/ambulance-stats")
-async def amb_stats(user=Depends(current_user)):
+async def amb_stats(user=Depends(require("analytics:read"))):
     pipe = [{"$group":{"_id":{"ambulance_type":"$ambulance_type","call_type":"$call_type","status":"$status"},"count":{"$sum":1}}}]
     return [{"ambulance_type":r["_id"]["ambulance_type"],"call_type":r["_id"]["call_type"],"status":r["_id"]["status"],"count":r["count"]}
             for r in await db.ambulance_calls.aggregate(pipe).to_list(200)]
@@ -1711,7 +1802,7 @@ async def list_notifs(user=Depends(current_user)):
 # SERVICES MASTER
 # ────────────────────────────────────────────────────────────────────────────
 @api.get("/services-legacy")
-async def services_legacy(user=Depends(current_user)):
+async def services_legacy(user=Depends(require("service:read"))):
     """Legacy hard-coded category groups — kept for backwards compatibility."""
     return [
         {"category":"Nursing","items":["24-Hour Nursing","12-Hour Nursing","Critical Care Nursing","Palliative Care Nursing","ICU at Home","Mother & Baby Care"]},
@@ -1725,10 +1816,10 @@ async def services_legacy(user=Depends(current_user)):
     ]
 
 @api.get("/upload/{sid}")
-async def legacy_upload(sid: int, user=Depends(current_user)): return []
+async def legacy_upload(sid: int, user=Depends(require("staff:read"))): return []
 
 @api.get("/documents/{sid}")
-async def legacy_docs(sid: int, user=Depends(current_user)):
+async def legacy_docs(sid: int, user=Depends(require("staff:read"))):
     return await list_col("staff_documents", {"staff_id": sid})
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1771,7 +1862,7 @@ def compute_compliance(s, docs):
 
 @api.get("/staff-compliance")
 async def staff_compliance(vendor: Optional[str]=None, role: Optional[str]=None,
-                           status: Optional[str]=None, user=Depends(current_user)):
+                           status: Optional[str]=None, user=Depends(require("compliance:read"))):
     q = {"status":"Active"}
     if vendor: q["vendor"] = vendor
     if role: q["role"] = role
@@ -1790,7 +1881,7 @@ async def staff_compliance(vendor: Optional[str]=None, role: Optional[str]=None,
     return results
 
 @api.get("/staff-compliance/summary")
-async def compliance_summary(user=Depends(current_user)):
+async def compliance_summary(user=Depends(require("compliance:read"))):
     staff_list = await list_col("staff", {"status":"Active"})
     counts = {"total":len(staff_list),"compliant":0,"partial":0,"non_compliant":0,"action_needed":0,"critical_alerts":0}
     for s in staff_list:
@@ -1804,7 +1895,7 @@ async def compliance_summary(user=Depends(current_user)):
     return counts
 
 @api.get("/staff-compliance/{sid}")
-async def compliance_detail(sid: int, user=Depends(current_user)):
+async def compliance_detail(sid: int, user=Depends(require("compliance:read"))):
     s = await db.staff.find_one({"id": sid}, {"_id":0})
     if not s: raise HTTPException(404, "Not found")
     docs = await list_col("staff_documents", {"staff_id": sid})
@@ -1815,7 +1906,7 @@ async def compliance_detail(sid: int, user=Depends(current_user)):
 # CONSENTS / FEEDBACK
 # ────────────────────────────────────────────────────────────────────────────
 @api.get("/consents")
-async def list_consents(patient_id: Optional[int]=None, user=Depends(current_user)):
+async def list_consents(patient_id: Optional[int]=None, user=Depends(require("consent:read"))):
     q = {"patient_id": patient_id} if patient_id else {}
     rows = await list_col("consents", q)
     pmap = {p["id"]: p for p in await list_col("patients")}
@@ -1826,20 +1917,20 @@ async def list_consents(patient_id: Optional[int]=None, user=Depends(current_use
     return rows
 
 @api.post("/consents")
-async def add_consent(d: Dict[str, Any], user=Depends(current_user)):
+async def add_consent(d: Dict[str, Any], user=Depends(require("consent:write"))):
     cid = await next_id("consents")
     await db.consents.insert_one({"id": cid, "status":"Signed", "created_at": now_iso(), **d})
     return {"id": cid, "message": "Consent recorded"}
 
 @api.get("/feedback")
-async def list_feedback(patient_id: Optional[int]=None, staff_id: Optional[int]=None, user=Depends(current_user)):
+async def list_feedback(patient_id: Optional[int]=None, staff_id: Optional[int]=None, user=Depends(require("feedback:read"))):
     q = {}
     if patient_id: q["patient_id"] = patient_id
     if staff_id: q["staff_id"] = staff_id
     return await list_col("feedback", q)
 
 @api.post("/feedback")
-async def add_feedback(d: Dict[str, Any], user=Depends(current_user)):
+async def add_feedback(d: Dict[str, Any], user=Depends(require("feedback:write"))):
     fid = await next_id("feedback")
     await db.feedback.insert_one({"id": fid, "created_at": now_iso(), **d})
     if d.get("staff_id") and d.get("staff_rating"):
@@ -1854,23 +1945,23 @@ async def add_feedback(d: Dict[str, Any], user=Depends(current_user)):
 # MCQ
 # ────────────────────────────────────────────────────────────────────────────
 @api.get("/mcq/questions")
-async def list_mcq(topic: Optional[str]=None, user=Depends(current_user)):
+async def list_mcq(topic: Optional[str]=None, user=Depends(require("mcq:read"))):
     q = {"topic": topic} if topic else {}
     return await list_col("mcq_questions", q, sort=("topic", 1))
 
 @api.post("/mcq/questions")
-async def add_mcq(d: Dict[str, Any], user=Depends(current_user)):
+async def add_mcq(d: Dict[str, Any], user=Depends(require("mcq:write"))):
     qid = await next_id("mcq_questions")
     await db.mcq_questions.insert_one({"id": qid, "marks": d.get("marks", 1), "created_at": now_iso(), **d})
     return {"id": qid, "message": "Question added"}
 
 @api.delete("/mcq/questions/{qid}")
-async def del_mcq(qid: int, user=Depends(current_user)):
+async def del_mcq(qid: int, user=Depends(require("mcq:write"))):
     await db.mcq_questions.delete_one({"id": qid})
     return {"message": "Question deleted"}
 
 @api.post("/mcq/submit")
-async def submit_mcq(body: Dict[str, Any], user=Depends(current_user)):
+async def submit_mcq(body: Dict[str, Any], user=Depends(require("mcq:write"))):
     questions = await list_col("mcq_questions", {"topic": body.get("topic")})
     if not questions: raise HTTPException(400, "No questions found")
     answers = body.get("answers", {})
@@ -1886,7 +1977,7 @@ async def submit_mcq(body: Dict[str, Any], user=Depends(current_user)):
             "message": f"Score: {score}% ({correct}/{total} correct)"}
 
 @api.get("/mcq/results")
-async def mcq_results(staff_id: Optional[int]=None, user=Depends(current_user)):
+async def mcq_results(staff_id: Optional[int]=None, user=Depends(require("mcq:read"))):
     q = {"staff_id": staff_id} if staff_id else {}
     rows = await list_col("mcq_results", q, sort=("submitted_at", -1))
     smap = {s["id"]: s for s in await list_col("staff")}
@@ -1902,7 +1993,7 @@ def _parse_salary(s):
 
 @api.get("/payroll")
 async def payroll(month: Optional[str]=None, staff_id: Optional[int]=None,
-                  vendor: Optional[str]=None, user=Depends(current_user)):
+                  vendor: Optional[str]=None, user=Depends(require("payroll:read"))):
     m = month or datetime.now().strftime("%Y-%m")
     q = {"status":"Active"}
     if staff_id: q["id"] = staff_id
@@ -1931,7 +2022,7 @@ async def payroll(month: Optional[str]=None, staff_id: Optional[int]=None,
     return result
 
 @api.post("/payroll/generate")
-async def payroll_gen(body: Dict[str, Any], user=Depends(current_user)):
+async def payroll_gen(body: Dict[str, Any], user=Depends(require("payroll:write"))):
     m = body.get("month")
     if not m: raise HTTPException(400, "month required")
     ids = body.get("staff_ids") or []
@@ -1957,14 +2048,14 @@ async def payroll_gen(body: Dict[str, Any], user=Depends(current_user)):
     return {"message": f"Payroll generated for {cnt} staff", "month": m}
 
 @api.patch("/payroll/{pid}/pay")
-async def payroll_pay(pid: int, body: Dict[str, Any], user=Depends(current_user)):
+async def payroll_pay(pid: int, body: Dict[str, Any], user=Depends(require("payroll:write"))):
     await db.payroll_records.update_one({"id": pid}, {"$set": {
         "payment_status":"Paid","payment_mode":body.get("payment_mode"),
         "payment_date": body.get("payment_date") or today(),"remarks": body.get("remarks","")}})
     return {"message": "Payment recorded"}
 
 @api.get("/payroll/records")
-async def payroll_records(month: Optional[str]=None, vendor: Optional[str]=None, user=Depends(current_user)):
+async def payroll_records(month: Optional[str]=None, vendor: Optional[str]=None, user=Depends(require("payroll:read"))):
     q = {}
     if month: q["month"] = month
     rows = await list_col("payroll_records", q)
@@ -1981,7 +2072,7 @@ async def payroll_records(month: Optional[str]=None, vendor: Optional[str]=None,
 # ────────────────────────────────────────────────────────────────────────────
 @api.get("/reports/staff-summary")
 async def staff_summary(frm: Optional[str]=Query(None, alias="from"), to: Optional[str]=None,
-                       vendor: Optional[str]=None, user=Depends(current_user)):
+                       vendor: Optional[str]=None, user=Depends(require("report:read"))):
     q = {"status":"Active"}
     if vendor: q["vendor"] = vendor
     staff = await list_col("staff", q)
@@ -1999,7 +2090,7 @@ async def staff_summary(frm: Optional[str]=Query(None, alias="from"), to: Option
     return out
 
 @api.get("/reports/patient-summary")
-async def patient_summary(user=Depends(current_user)):
+async def patient_summary(user=Depends(require("report:read"))):
     pipe = [{"$group":{"_id":{"service_location":"$service_location","category":"$category","status":"$status"},"count":{"$sum":1}}},
             {"$sort":{"count":-1}}]
     return [{"service_location":r["_id"].get("service_location"),"category":r["_id"].get("category"),
@@ -2008,7 +2099,7 @@ async def patient_summary(user=Depends(current_user)):
 
 @api.get("/reports/revenue-summary")
 async def revenue_summary(frm: Optional[str]=Query(None, alias="from"), to: Optional[str]=None,
-                          user=Depends(current_user)):
+                          user=Depends(require("report:read"))):
     match = {}
     if frm: match["date"] = {"$gte": frm}
     if to: match.setdefault("date", {})["$lte"] = to
@@ -2021,7 +2112,7 @@ async def revenue_summary(frm: Optional[str]=Query(None, alias="from"), to: Opti
     return [{"month":r["_id"], **{k:r[k] for k in r if k!="_id"}} for r in await db.bills.aggregate(pipe).to_list(36)]
 
 @api.get("/alerts/amc-cmc")
-async def amc_cmc(user=Depends(current_user)):
+async def amc_cmc(user=Depends(require("compliance:read"))):
     in30 = in_days(30)
     out = []
     async for a in db.assets.find({"$or": [{"amc_date": {"$lte": in30, "$ne": None}}, {"cmc_date": {"$lte": in30, "$ne": None}}]}, {"_id":0}):
@@ -2033,7 +2124,7 @@ async def amc_cmc(user=Depends(current_user)):
     return out
 
 @api.get("/alerts/document-expiry")
-async def doc_expiry(user=Depends(current_user)):
+async def doc_expiry(user=Depends(require("compliance:read"))):
     in30 = in_days(30)
     docs = await db.staff_documents.find({"expiry_date": {"$lte": in30, "$ne": None}}, {"_id":0}).sort("expiry_date",1).to_list(500)
     smap = {s["id"]: s for s in await list_col("staff")}
@@ -2051,23 +2142,24 @@ async def list_users(user=Depends(require("admin:read"))):
     return rows
 
 @api.post("/users")
-async def create_user(d: Dict[str, Any], user=Depends(current_user)):
-    if user.get("role") != "admin": raise HTTPException(403, "Admin only")
+async def create_user(d: Dict[str, Any], user=Depends(require("admin:write"))):
     if d.get("role") not in ROLES: raise HTTPException(400, f"Role must be one of {ROLES}")
+    if not d.get("role"): raise HTTPException(400, "Role is required at creation time")
     if await db.users.find_one({"username": d.get("username")}):
         raise HTTPException(400, "Username already exists")
     uid = await next_id("users")
+    default_pwd = d.get("password", "Temp@1234")
     doc = {"id": uid, "username": d["username"], "name": d.get("name", d["username"]),
-           "role": d["role"], "password": pwd_ctx.hash(d.get("password", "Change@1234")),
-           "status": "Active", "phone": d.get("phone",""), "email": d.get("email",""),
+           "role": d["role"], "password": pwd_ctx.hash(default_pwd),
+           "must_change_password": True, "status": "Active",
+           "phone": d.get("phone",""), "email": d.get("email",""),
            "created_at": now_iso()}
     await db.users.insert_one(doc)
     await audit(user, "create", "user", uid, after={"username": d["username"], "role": d["role"]})
-    return {"id": uid, "message": "User created"}
+    return {"id": uid, "message": "User created. Default password: " + default_pwd}
 
 @api.put("/users/{uid}")
-async def update_user(uid: int, d: Dict[str, Any], user=Depends(current_user)):
-    if user.get("role") != "admin": raise HTTPException(403, "Admin only")
+async def update_user(uid: int, d: Dict[str, Any], user=Depends(require("admin:write"))):
     update = {k: v for k, v in d.items() if k in ("name", "role", "phone", "email", "status")}
     if d.get("password"): update["password"] = pwd_ctx.hash(d["password"])
     if update.get("role") and update["role"] not in ROLES:
@@ -2078,8 +2170,7 @@ async def update_user(uid: int, d: Dict[str, Any], user=Depends(current_user)):
     return {"message": "User updated"}
 
 @api.delete("/users/{uid}")
-async def delete_user(uid: int, user=Depends(current_user)):
-    if user.get("role") != "admin": raise HTTPException(403, "Admin only")
+async def delete_user(uid: int, user=Depends(require("admin:write"))):
     if uid == user.get("id"): raise HTTPException(400, "Cannot delete yourself")
     await db.users.update_one({"id": uid}, {"$set": {"status": "Disabled"}})
     await audit(user, "disable", "user", uid)
@@ -2095,7 +2186,7 @@ async def list_roles(user=Depends(current_user)):
     return [{"role": r, "permissions": sorted(list(PERMS.get(r, set())))} for r in ROLES]
 
 @api.post("/admin/reset-database")
-async def reset_database(body: Optional[Dict[str, Any]] = None, user=Depends(current_user)):
+async def reset_database(body: Optional[Dict[str, Any]] = None, user=Depends(require("admin:write"))):
     """
     Admin-only: wipe MongoDB collections and re-run seeds.
     Body (optional):
@@ -2168,7 +2259,7 @@ async def reset_database(body: Optional[Dict[str, Any]] = None, user=Depends(cur
 # WALLET — patient prepaid balance, transactions, refund requests, reports
 # ────────────────────────────────────────────────────────────────────────────
 @api.post("/wallet/admin/bulk-credit")
-async def admin_bulk_credit(body: Dict[str, Any], user=Depends(current_user)):
+async def admin_bulk_credit(body: Dict[str, Any], user=Depends(require("wallet:write"))):
     """Admin-only: credit multiple wallets at once.
 
     Body: {"entries": [{"patient_id": 1, "amount": 5000, "remarks": "..."}], "remarks": "default"}
@@ -2218,7 +2309,7 @@ async def admin_bulk_credit(body: Dict[str, Any], user=Depends(current_user)):
     }
 
 @api.post("/wallet/admin/recalculate")
-async def admin_recalculate_wallets(user=Depends(current_user)):
+async def admin_recalculate_wallets(user=Depends(require("wallet:write"))):
     """Admin-only: rebuild wallet balances from the transaction ledger and
     backfill any missing credits from historical Stopped/Converted/Cancelled
     bookings. Safe & idempotent — run anytime balances look wrong."""
@@ -2238,7 +2329,7 @@ async def admin_recalculate_wallets(user=Depends(current_user)):
     }
 
 @api.get("/wallet/dashboard-stats")
-async def wallet_dashboard_stats(user=Depends(current_user)):
+async def wallet_dashboard_stats(user=Depends(require("wallet:read"))):
     a = await db.patient_wallets.aggregate([{"$group":{"_id":None,"v":{"$sum":"$current_balance"}}}]).to_list(1)
     total_balance = a[0]["v"] if a else 0
     month_start = dt_date.today().replace(day=1).isoformat()
@@ -2262,7 +2353,7 @@ async def wallet_dashboard_stats(user=Depends(current_user)):
 @api.get("/wallets")
 async def list_wallets(min_balance: Optional[float]=None,
                        search: Optional[str]=None,
-                       user=Depends(current_user)):
+                       user=Depends(require("wallet:read"))):
     """Wallet overview list (admin/manager/accountant).
 
     Returns one row per Active patient. If a patient has no wallet record yet,
@@ -2325,7 +2416,7 @@ async def list_wallets(min_balance: Optional[float]=None,
 @api.get("/wallet/refund-requests")
 async def list_refund_requests(status: Optional[str]=None,
                                patient_id: Optional[int]=None,
-                               user=Depends(current_user)):
+                               user=Depends(require("wallet:read"))):
     q = {}
     if status: q["status"] = status
     if patient_id: q["patient_id"] = patient_id
@@ -2339,7 +2430,7 @@ async def list_refund_requests(status: Optional[str]=None,
     return rows
 
 @api.patch("/wallet/refund-requests/{rid}/status")
-async def update_refund_request(rid: int, body: Dict[str, Any], user=Depends(current_user)):
+async def update_refund_request(rid: int, body: Dict[str, Any], user=Depends(require("refund:approve"))):
     if not is_super_admin(user):
         raise HTTPException(403, "Only Super Admin can update refund request status")
     cur = await db.wallet_refund_requests.find_one({"id": rid})
@@ -2374,7 +2465,7 @@ async def update_refund_request(rid: int, body: Dict[str, Any], user=Depends(cur
     return {"message": f"Refund request {new_status}"}
 
 @api.get("/wallet/{pid}")
-async def get_wallet(pid: int, user=Depends(current_user)):
+async def get_wallet(pid: int, user=Depends(require("wallet:read"))):
     w = await _ensure_wallet(pid)
     p = await db.patients.find_one({"id": pid}, {"_id": 0})
     w.pop("_id", None)
@@ -2388,7 +2479,7 @@ async def wallet_transactions(pid: int,
                               tx_type: Optional[str] = None,
                               frm: Optional[str] = Query(None, alias="from"),
                               to:  Optional[str] = None,
-                              user=Depends(current_user)):
+                              user=Depends(require("wallet:read"))):
     q = {"patient_id": pid}
     if tx_type:
         q["transaction_type"] = tx_type.upper()
@@ -2399,7 +2490,7 @@ async def wallet_transactions(pid: int,
     return await list_col("wallet_transactions", q, sort=("id", -1))
 
 @api.post("/wallet/{pid}/adjust")
-async def adjust_wallet(pid: int, body: Dict[str, Any], user=Depends(current_user)):
+async def adjust_wallet(pid: int, body: Dict[str, Any], user=Depends(require("wallet:write"))):
     """Manual wallet adjustment — Super Admin only."""
     if not is_super_admin(user):
         raise HTTPException(403, "Only Super Admin can adjust wallet")
@@ -2415,7 +2506,7 @@ async def adjust_wallet(pid: int, body: Dict[str, Any], user=Depends(current_use
 
 # ── Refund Request workflow (Pending → Approved → Completed | Rejected) ──
 @api.post("/wallet/{pid}/refund-request")
-async def create_refund_request(pid: int, body: Dict[str, Any], user=Depends(current_user)):
+async def create_refund_request(pid: int, body: Dict[str, Any], user=Depends(require("refund:initiate"))):
     w = await _ensure_wallet(pid)
     amt = float(body.get("amount") or 0)
     if amt <= 0:
@@ -2445,7 +2536,7 @@ async def create_refund_request(pid: int, body: Dict[str, Any], user=Depends(cur
 
 # ── Booking lifecycle: STOP (credit wallet) & CONVERT (recalc + new booking) ──
 @api.post("/bookings/{bid}/stop")
-async def stop_booking(bid: int, body: Dict[str, Any], user=Depends(current_user)):
+async def stop_booking(bid: int, body: Dict[str, Any], user=Depends(require("booking:write"))):
     if user.get("role") not in COORDINATOR_ROLES:
         raise HTTPException(403, "Not allowed to stop a booking")
     booking = await db.bookings.find_one({"id": bid})
@@ -2509,7 +2600,7 @@ async def stop_booking(bid: int, body: Dict[str, Any], user=Depends(current_user
     }
 
 @api.post("/bookings/{bid}/convert")
-async def convert_booking(bid: int, body: Dict[str, Any], user=Depends(current_user)):
+async def convert_booking(bid: int, body: Dict[str, Any], user=Depends(require("booking:write"))):
     if not is_manager_or_admin(user):
         raise HTTPException(403, "Only Super Admin / Manager can convert a service")
     cur = await db.bookings.find_one({"id": bid})
@@ -2632,7 +2723,7 @@ async def convert_booking(bid: int, body: Dict[str, Any], user=Depends(current_u
     }
 
 @api.get("/bookings/{bid}/history")
-async def get_booking_history(bid: int, user=Depends(current_user)):
+async def get_booking_history(bid: int, user=Depends(require("booking:read"))):
     return await list_col("booking_history", {"booking_id": bid}, sort=("id", -1))
 
 # ── Wallet reports ─────────────────────────────────────────────────────────
@@ -2641,7 +2732,7 @@ async def wallet_report(frm: Optional[str] = Query(None, alias="from"),
                         to:  Optional[str] = None,
                         patient_id: Optional[int] = None,
                         tx_type:    Optional[str] = None,
-                        user=Depends(current_user)):
+                        user=Depends(require("report:read"))):
     q: Dict[str, Any] = {}
     if frm: q["created_at"] = {"$gte": frm}
     if to:  q.setdefault("created_at", {})["$lte"] = to + "T23:59:59"
@@ -2667,7 +2758,7 @@ async def wallet_report(frm: Optional[str] = Query(None, alias="from"),
 async def list_audit(target_type: Optional[str]=None, action: Optional[str]=None,
                      user_id: Optional[int]=None, frm: Optional[str]=Query(None, alias="from"),
                      to: Optional[str]=None, limit: int=Query(200, le=2000),
-                     user=Depends(current_user)):
+                     user=Depends(require("admin:read"))):
     if user.get("role") not in ("admin", "manager"): raise HTTPException(403, "Admin/Manager only")
     q = {}
     if target_type: q["target_type"] = target_type
@@ -2701,7 +2792,7 @@ EXPORT_SOURCES = {
 }
 
 @api.get("/exports/{entity}.csv")
-async def export_csv(entity: str, user=Depends(current_user)):
+async def export_csv(entity: str, user=Depends(require("export:read"))):
     if entity not in EXPORT_SOURCES: raise HTTPException(404, "Unknown entity")
     col, cols = EXPORT_SOURCES[entity]
     rows = await db[col].find({}, {"_id":0}).to_list(20000)
@@ -2712,7 +2803,7 @@ async def export_csv(entity: str, user=Depends(current_user)):
         headers={"Content-Disposition": f'attachment; filename="{entity}-{today()}.csv"'})
 
 @api.get("/exports/{entity}.xlsx")
-async def export_xlsx(entity: str, user=Depends(current_user)):
+async def export_xlsx(entity: str, user=Depends(require("export:read"))):
     if entity not in EXPORT_SOURCES: raise HTTPException(404, "Unknown entity")
     from openpyxl import Workbook
     col, cols = EXPORT_SOURCES[entity]
@@ -2779,7 +2870,7 @@ def _brand_header(P, styles):
     return [tbl]
 
 @api.get("/pdf/receipt/{bill_id}")
-async def pdf_receipt(bill_id: int, user=Depends(current_user)):
+async def pdf_receipt(bill_id: int, user=Depends(require("pdf:read"))):
     bill = await db.bills.find_one({"id": bill_id}, {"_id":0})
     if not bill: raise HTTPException(404, "Bill not found")
     patient = await db.patients.find_one({"id": bill.get("patient_id")}, {"_id":0}) or {}
@@ -2816,7 +2907,7 @@ async def pdf_receipt(bill_id: int, user=Depends(current_user)):
         headers={"Content-Disposition": f'inline; filename="receipt-{bill.get("receipt_number","")}.pdf"'})
 
 @api.get("/pdf/payslip/{staff_id}")
-async def pdf_payslip(staff_id: int, month: str = Query(...), user=Depends(current_user)):
+async def pdf_payslip(staff_id: int, month: str = Query(...), user=Depends(require("pdf:read"))):
     s = await db.staff.find_one({"id": staff_id}, {"_id":0})
     if not s: raise HTTPException(404, "Staff not found")
     rec = await db.payroll_records.find_one({"staff_id": staff_id, "month": month}, {"_id":0})
@@ -2859,7 +2950,7 @@ async def pdf_payslip(staff_id: int, month: str = Query(...), user=Depends(curre
         headers={"Content-Disposition": f'inline; filename="payslip-{s.get("code","")}-{month}.pdf"'})
 
 @api.get("/pdf/report/{kind}")
-async def pdf_report(kind: str, frm: Optional[str]=Query(None, alias="from"), to: Optional[str]=None, user=Depends(current_user)):
+async def pdf_report(kind: str, frm: Optional[str]=Query(None, alias="from"), to: Optional[str]=None, user=Depends(require("pdf:read"))):
     if kind not in ("staff-summary","patient-summary","revenue-summary"):
         raise HTTPException(404, "Unknown report")
     if kind == "staff-summary":
@@ -2893,7 +2984,7 @@ async def pdf_report(kind: str, frm: Optional[str]=Query(None, alias="from"), to
         headers={"Content-Disposition": f'inline; filename="{kind}-{today()}.pdf"'})
 
 @api.get("/pdf/patient/{pid}")
-async def pdf_patient(pid: int, user=Depends(current_user)):
+async def pdf_patient(pid: int, user=Depends(require("pdf:read"))):
     """Generates a patient summary card PDF — registration details, diagnosis, medications, recent vitals."""
     p = await db.patients.find_one({"id": pid}, {"_id":0})
     if not p: raise HTTPException(404, "Patient not found")
@@ -3437,11 +3528,11 @@ CONSENT_RENDERERS = {
 }
 
 @api.get("/consent-types")
-async def list_consent_types(user=Depends(current_user)):
+async def list_consent_types(user=Depends(require("consent:read"))):
     return [{"value": t, "label": t} for t in CONSENT_TYPES]
 
 @api.get("/pdf/consent/{cid}")
-async def pdf_consent(cid: int, user=Depends(current_user)):
+async def pdf_consent(cid: int, user=Depends(require("pdf:read"))):
     """Generates a clinical consent PDF in the appropriate Reach Out HOMS template."""
     c = await db.consents.find_one({"id": cid}, {"_id":0})
     if not c: raise HTTPException(404, "Consent not found")
@@ -3522,25 +3613,25 @@ def render_template(body: str, ctx: Dict[str, Any]) -> str:
     return re.sub(r"\{\{[^}]+\}\}", "", out)
 
 @api.get("/notif-templates")
-async def list_templates(user=Depends(current_user)):
+async def list_templates(user=Depends(require("notification:read"))):
     return await list_col("notif_templates", sort=("code", 1))
 
 @api.post("/notif-templates")
-async def add_template(d: Dict[str, Any], user=Depends(current_user)):
+async def add_template(d: Dict[str, Any], user=Depends(require("notification:write"))):
     if user.get("role") not in ("admin","manager"): raise HTTPException(403, "Admin/Manager only")
     tid = await next_id("notif_templates")
     await db.notif_templates.insert_one({"id": tid, "status":"Active", "created_at": now_iso(), **d})
     await audit(user, "create", "notif_template", tid, after=d); return {"id": tid, "message":"Template created"}
 
 @api.put("/notif-templates/{tid}")
-async def upd_template(tid: int, d: Dict[str, Any], user=Depends(current_user)):
+async def upd_template(tid: int, d: Dict[str, Any], user=Depends(require("notification:write"))):
     if user.get("role") not in ("admin","manager"): raise HTTPException(403, "Admin/Manager only")
     d.pop("id", None); d.pop("_id", None)
     await db.notif_templates.update_one({"id": tid}, {"$set": d})
     await audit(user, "update", "notif_template", tid, after=d); return {"message":"Template updated"}
 
 @api.post("/notifications/send")
-async def send_notification(d: Dict[str, Any], user=Depends(current_user)):
+async def send_notification(d: Dict[str, Any], user=Depends(require("notification:write"))):
     """Render template and enqueue. Supports whatsapp/sms/email/in-app channels."""
     tpl = None
     if d.get("template_code"): tpl = await db.notif_templates.find_one({"code": d["template_code"]})
@@ -3561,7 +3652,7 @@ async def send_notification(d: Dict[str, Any], user=Depends(current_user)):
     return {"id": nid, "channel": channel, "preview": body, "message":"Queued"}
 
 @api.post("/notifications/dispatch")
-async def dispatch_queue(user=Depends(current_user)):
+async def dispatch_queue(user=Depends(require("notification:write"))):
     """Mock dispatcher — flips Pending notifications to Sent. Real WhatsApp/SMS providers plug in here."""
     if user.get("role") not in ("admin","manager"): raise HTTPException(403, "Admin/Manager only")
     pending = await db.notifications.find({"status":"Pending"}).to_list(500)
@@ -3576,7 +3667,7 @@ async def dispatch_queue(user=Depends(current_user)):
     return {"dispatched": sent, "channel_breakdown": {c: sum(1 for n in pending if n.get("channel")==c) for c in ["whatsapp","sms","email","in-app"]}}
 
 @api.get("/notifications/queue")
-async def queue_status(status: Optional[str]=None, user=Depends(current_user)):
+async def queue_status(status: Optional[str]=None, user=Depends(require("notification:read"))):
     q = {}
     if status: q["status"] = status
     rows = await db.notifications.find(q, {"_id":0}).sort("id", -1).limit(200).to_list(200)
@@ -3628,7 +3719,7 @@ async def otp_verify(body: Dict[str, Any]):
 # AUTO ROSTER / SMART STAFF ALLOCATION ENGINE
 # ────────────────────────────────────────────────────────────────────────────
 @api.post("/roster/auto-allocate")
-async def auto_allocate(d: Dict[str, Any], user=Depends(current_user)):
+async def auto_allocate(d: Dict[str, Any], user=Depends(require("roster:write"))):
     """Suggest best staff for a booking using weighted scoring:
        40% rating, 25% availability, 20% vendor match, 10% role match, 5% location proximity."""
     patient_id = d.get("patient_id")
@@ -3687,7 +3778,7 @@ async def auto_allocate(d: Dict[str, Any], user=Depends(current_user)):
 # GEOFENCING — store fence per roster, validate on attendance
 # ────────────────────────────────────────────────────────────────────────────
 @api.patch("/roster/{rid}/geofence")
-async def set_geofence(rid: int, body: Dict[str, Any], user=Depends(current_user)):
+async def set_geofence(rid: int, body: Dict[str, Any], user=Depends(require("roster:write"))):
     lat = float(body.get("lat")); lng = float(body.get("lng")); radius = int(body.get("radius_m", 200))
     await db.roster.update_one({"id": rid}, {"$set": {"geofence": {"lat": lat, "lng": lng, "radius_m": radius}}})
     return {"message": "Geofence set", "lat": lat, "lng": lng, "radius_m": radius}
@@ -3723,7 +3814,7 @@ async def att_login_geo(staff_id: int = Form(...), lat: float = Form(...), lng: 
 # NPS + REVENUE FORECAST
 # ────────────────────────────────────────────────────────────────────────────
 @api.get("/analytics/nps")
-async def nps(user=Depends(current_user)):
+async def nps(user=Depends(require("analytics:read"))):
     """NPS from feedback.service_rating (5=promoter, 4=passive, ≤3=detractor)."""
     pipe = [{"$match":{"service_rating":{"$exists":True}}},
             {"$group":{"_id":None,
@@ -3741,7 +3832,7 @@ async def nps(user=Depends(current_user)):
             "detractor_pct": round(r["detractors"]/t*100,1)}
 
 @api.get("/analytics/revenue-forecast")
-async def revenue_forecast(months: int = Query(3, ge=1, le=12), user=Depends(current_user)):
+async def revenue_forecast(months: int = Query(3, ge=1, le=12), user=Depends(require("analytics:read"))):
     """Simple linear regression on monthly revenue → forecast next N months."""
     hist = await monthly_rev(user)
     hist = list(reversed(hist))[-12:]  # ascending, last 12
@@ -3763,7 +3854,7 @@ async def revenue_forecast(months: int = Query(3, ge=1, le=12), user=Depends(cur
             "trend": "growing" if slope > 0 else "declining", "slope_per_month": round(slope, 2)}
 
 @api.get("/analytics/staff-demand-forecast")
-async def staff_demand(user=Depends(current_user)):
+async def staff_demand(user=Depends(require("analytics:read"))):
     """Forecast staff required from booking pipeline."""
     pipe = [{"$match":{"status":{"$in":["Active","Pending"]}}},
             {"$group":{"_id":"$service_category","bookings":{"$sum":1},"revenue":{"$sum":"$amount"}}}]
@@ -3781,14 +3872,14 @@ async def staff_demand(user=Depends(current_user)):
 # INVENTORY + EQUIPMENT LENDING
 # ────────────────────────────────────────────────────────────────────────────
 @api.get("/inventory")
-async def list_inventory(category: Optional[str]=None, status: Optional[str]=None, user=Depends(current_user)):
+async def list_inventory(category: Optional[str]=None, status: Optional[str]=None, user=Depends(require("inventory:read"))):
     q = {}
     if category: q["category"] = category
     if status: q["status"] = status
     return await list_col("inventory_items", q, sort=("name", 1))
 
 @api.post("/inventory")
-async def add_inventory(d: Dict[str, Any], user=Depends(current_user)):
+async def add_inventory(d: Dict[str, Any], user=Depends(require("inventory:write"))):
     if user.get("role") not in ("admin","manager"): raise HTTPException(403, "Admin/Manager only")
     iid = await next_id("inventory_items")
     code = f"INV-{int(datetime.now().timestamp())}"
@@ -3801,13 +3892,13 @@ async def add_inventory(d: Dict[str, Any], user=Depends(current_user)):
     return {"id": iid, "item_code": code, "message": "Inventory item added"}
 
 @api.put("/inventory/{iid}")
-async def upd_inventory(iid: int, d: Dict[str, Any], user=Depends(current_user)):
+async def upd_inventory(iid: int, d: Dict[str, Any], user=Depends(require("inventory:write"))):
     d.pop("id", None); d.pop("_id", None); d.pop("available_qty", None); d.pop("lent_qty", None)
     await db.inventory_items.update_one({"id": iid}, {"$set": d})
     return {"message":"Updated"}
 
 @api.get("/lendings")
-async def list_lendings(status: Optional[str]=None, patient_id: Optional[int]=None, user=Depends(current_user)):
+async def list_lendings(status: Optional[str]=None, patient_id: Optional[int]=None, user=Depends(require("lending:read"))):
     q = {}
     if status: q["status"] = status
     if patient_id: q["patient_id"] = patient_id
@@ -3821,7 +3912,7 @@ async def list_lendings(status: Optional[str]=None, patient_id: Optional[int]=No
     return rows
 
 @api.post("/lendings")
-async def add_lending(d: Dict[str, Any], user=Depends(current_user)):
+async def add_lending(d: Dict[str, Any], user=Depends(require("lending:write"))):
     item = await db.inventory_items.find_one({"id": d.get("item_id")})
     if not item: raise HTTPException(404, "Item not found")
     qty = int(d.get("qty", 1))
@@ -3837,7 +3928,7 @@ async def add_lending(d: Dict[str, Any], user=Depends(current_user)):
     return {"id": lid, "message":"Equipment lent"}
 
 @api.patch("/lendings/{lid}/return")
-async def return_lending(lid: int, body: Dict[str, Any], user=Depends(current_user)):
+async def return_lending(lid: int, body: Dict[str, Any], user=Depends(require("lending:write"))):
     l = await db.lendings.find_one({"id": lid})
     if not l or l.get("status") != "Issued": raise HTTPException(400, "Not an active lending")
     cond = body.get("condition_at_return","Good")
@@ -3853,7 +3944,7 @@ async def return_lending(lid: int, body: Dict[str, Any], user=Depends(current_us
 # INCIDENT WORKFLOW
 # ────────────────────────────────────────────────────────────────────────────
 @api.post("/incidents/{iid}/assign-investigator")
-async def assign_inv(iid: int, body: Dict[str, Any], user=Depends(current_user)):
+async def assign_inv(iid: int, body: Dict[str, Any], user=Depends(require("incident:write"))):
     if user.get("role") not in ("admin","manager","supervisor"): raise HTTPException(403, "Forbidden")
     await db.incidents.update_one({"id": iid}, {"$set": {"investigator_id": body.get("investigator_id"),
         "investigator_name": body.get("investigator_name"), "status":"Under Investigation",
@@ -3861,14 +3952,14 @@ async def assign_inv(iid: int, body: Dict[str, Any], user=Depends(current_user))
     await audit(user, "assign", "incident", iid, after=body); return {"message":"Investigator assigned"}
 
 @api.post("/incidents/{iid}/findings")
-async def inc_findings(iid: int, body: Dict[str, Any], user=Depends(current_user)):
+async def inc_findings(iid: int, body: Dict[str, Any], user=Depends(require("incident:write"))):
     await db.incidents.update_one({"id": iid}, {"$set": {"findings": body.get("findings",""),
         "root_cause": body.get("root_cause",""), "corrective_action": body.get("corrective_action",""),
         "findings_at": now_iso()}})
     return {"message":"Findings recorded"}
 
 @api.post("/incidents/{iid}/close")
-async def inc_close(iid: int, body: Dict[str, Any], user=Depends(current_user)):
+async def inc_close(iid: int, body: Dict[str, Any], user=Depends(require("incident:write"))):
     if user.get("role") not in ("admin","manager"): raise HTTPException(403, "Admin/Manager only")
     await db.incidents.update_one({"id": iid}, {"$set": {"status":"Closed",
         "resolution": body.get("resolution",""), "closed_by": user.get("name"), "closed_at": now_iso()}})
@@ -3878,7 +3969,7 @@ async def inc_close(iid: int, body: Dict[str, Any], user=Depends(current_user)):
 # ADVANCED PAYROLL — Detailed breakdown
 # ────────────────────────────────────────────────────────────────────────────
 @api.get("/payroll/{staff_id}/details")
-async def payroll_details(staff_id: int, month: str = Query(...), user=Depends(current_user)):
+async def payroll_details(staff_id: int, month: str = Query(...), user=Depends(require("payroll:read"))):
     s = await db.staff.find_one({"id": staff_id}, {"_id":0})
     if not s: raise HTTPException(404, "Staff not found")
     att = await db.attendance.find({"staff_id": staff_id, "date": {"$regex": f"^{month}"}}).to_list(200)
@@ -3919,7 +4010,7 @@ async def payroll_details(staff_id: int, month: str = Query(...), user=Depends(c
 # ────────────────────────────────────────────────────────────────────────────
 # PATIENT APP — Self-service endpoints
 # ────────────────────────────────────────────────────────────────────────────
-async def patient_only(user=Depends(current_user)):
+async def patient_only(user=Depends(require("payroll:read"))):
     if user.get("role") != "patient": raise HTTPException(403, "Patient app only")
     return user
 
@@ -4130,7 +4221,7 @@ class ServiceIn(dict):
     pass
 
 @api.get("/services")
-async def list_services(category: Optional[str] = None, active_only: bool = True, user=Depends(current_user)):
+async def list_services(category: Optional[str] = None, active_only: bool = True, user=Depends(require("service:read"))):
     q = {}
     if category: q["category"] = category
     if active_only: q["is_active"] = True
@@ -4138,12 +4229,12 @@ async def list_services(category: Optional[str] = None, active_only: bool = True
     return rows
 
 @api.get("/services/categories")
-async def list_service_categories(user=Depends(current_user)):
+async def list_service_categories(user=Depends(require("service:read"))):
     cats = await db.services.distinct("category", {"is_active": True})
     return sorted(cats)
 
 @api.post("/services")
-async def create_service(body: dict, user=Depends(current_user)):
+async def create_service(body: dict, user=Depends(require("service:write"))):
     if user.get("role") not in ("admin","manager","accountant"):
         raise HTTPException(403, "Only admin/manager/accountant can manage services")
     if not body.get("name") or not body.get("category"):
@@ -4168,7 +4259,7 @@ async def create_service(body: dict, user=Depends(current_user)):
     return {"id": next_sid, "message": "Service added"}
 
 @api.put("/services/{sid}")
-async def update_service(sid: int, body: dict, user=Depends(current_user)):
+async def update_service(sid: int, body: dict, user=Depends(require("service:write"))):
     if user.get("role") not in ("admin","manager","accountant"):
         raise HTTPException(403, "Only admin/manager/accountant can manage services")
     allowed = ["code","category","name","unit","package_rate","standard_rate","ppe_included","gst_pct","hsn_code","description","is_active"]
@@ -4184,7 +4275,7 @@ async def update_service(sid: int, body: dict, user=Depends(current_user)):
     return {"message": "Service updated"}
 
 @api.delete("/services/{sid}")
-async def delete_service(sid: int, user=Depends(current_user)):
+async def delete_service(sid: int, user=Depends(require("service:write"))):
     if user.get("role") != "admin":
         raise HTTPException(403, "Only admin can delete services")
     # Soft delete (preserve historical bills referencing this)
@@ -4237,7 +4328,7 @@ def _num_to_words_inr(n):
 
 # ── NEW: Receipt PDF in user's exact format ──────────────────────────────
 @api.get("/pdf/receipt-v2/{bill_id}")
-async def pdf_receipt_v2(bill_id: int, payment_idx: int = 0, user=Depends(current_user)):
+async def pdf_receipt_v2(bill_id: int, payment_idx: int = 0, user=Depends(require("pdf:read"))):
     """Clean tabular receipt — matches user's physical receipt book."""
     b = await db.bills.find_one({"id": bill_id}, {"_id":0})
     if not b: raise HTTPException(404, "Bill not found")
@@ -4372,7 +4463,7 @@ async def pdf_receipt_v2(bill_id: int, payment_idx: int = 0, user=Depends(curren
 
 # ── NEW: Total Services Invoice (final patient bill) ─────────────────────
 @api.get("/pdf/invoice/{patient_id}")
-async def pdf_total_invoice(patient_id: int, user=Depends(current_user)):
+async def pdf_total_invoice(patient_id: int, user=Depends(require("pdf:read"))):
     """Aggregates ALL bills for a patient into one itemized invoice."""
     p = await db.patients.find_one({"id": patient_id}, {"_id":0})
     if not p: raise HTTPException(404, "Patient not found")
@@ -4483,7 +4574,7 @@ async def pdf_total_invoice(patient_id: int, user=Depends(current_user)):
 
 # ── NEW: Refund Details PDF — exact REACH OUT format ─────────────────────
 @api.get("/pdf/refund-details/{refund_id}")
-async def pdf_refund_details(refund_id: int, user=Depends(current_user)):
+async def pdf_refund_details(refund_id: int, user=Depends(require("pdf:read"))):
     r = await db.refunds.find_one({"id": refund_id}, {"_id":0})
     if not r: raise HTTPException(404, "Refund not found")
     p = await db.patients.find_one({"id": r.get("patient_id")}, {"_id":0}) or {}
@@ -4571,7 +4662,7 @@ async def pdf_refund_details(refund_id: int, user=Depends(current_user)):
 
 # ── Helper for refunds: compute refund from a bill (used by frontend preview) ──
 @api.get("/refunds/preview/{bill_id}")
-async def refund_preview(bill_id: int, shifts_availed: int = 0, admin_pct: float = 10, user=Depends(current_user)):
+async def refund_preview(bill_id: int, shifts_availed: int = 0, admin_pct: float = 10, user=Depends(require("refund:read"))):
     """Returns a preview of the refund calculation using package vs standard rate."""
     b = await db.bills.find_one({"id": bill_id}, {"_id":0})
     if not b: raise HTTPException(404, "Bill not found")

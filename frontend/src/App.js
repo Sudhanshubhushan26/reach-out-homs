@@ -10,6 +10,7 @@ import {
 } from "./Phase2";
 
 const API = (process.env.REACT_APP_BACKEND_URL || "") + "/api";
+import { formatInr, formatInrShort } from "./utils/formatInr";
 
 // ─── DESIGN SYSTEM ── Stripe-inspired, vibrant, high-energy ─────────────────
 const C = {
@@ -983,6 +984,10 @@ function LoginPage({ setToken, setUser }) {
   const [err, setErr] = useState("");
   const [loading, setLoading] = useState(false);
   const [mounted, setMounted] = useState(false);
+  const [mustChange, setMustChange] = useState(false);
+  const [tempToken, setTempToken] = useState("");
+  const [newPwd, setNewPwd] = useState("");
+  const [confirmPwd, setConfirmPwd] = useState("");
   useEffect(() => { injectStyles(); setTimeout(()=>setMounted(true),50); }, []);
 
   async function submit() {
@@ -990,9 +995,35 @@ function LoginPage({ setToken, setUser }) {
     try {
       const r = await apiFetch("/login",{ method:"POST", body:JSON.stringify({ username:u, password:p }) });
       const d = await r.json();
-      if (d.success) { localStorage.setItem("ro_token",d.token); setToken(d.token); setUser(d); }
+      if (d.success) {
+        if (d.must_change_password) {
+          setTempToken(d.token); setMustChange(true); setErr(""); setP("");
+        } else {
+          localStorage.setItem("ro_token",d.token); setToken(d.token); setUser(d);
+        }
+      }
       else setErr(d.message||"Invalid credentials");
-    } catch { setErr("Cannot connect to server. Is the backend running on port 5000?"); }
+    } catch { setErr("Cannot connect to server. Is the backend running?"); }
+    setLoading(false);
+  }
+
+  async function doForceChange() {
+    setErr("");
+    if (newPwd.length < 8) { setErr("Password must be at least 8 characters"); return; }
+    if (newPwd !== confirmPwd) { setErr("Passwords do not match"); return; }
+    if (newPwd === "Temp@1234") { setErr("New password cannot be the default password"); return; }
+    setLoading(true);
+    try {
+      const r = await apiFetch("/force-change-password",{
+        method:"POST",
+        headers:{ "Content-Type":"application/json", Authorization:`Bearer ${tempToken}` },
+        body:JSON.stringify({ new_password:newPwd })
+      });
+      const d = await r.json();
+      if (d.success) {
+        localStorage.setItem("ro_token",d.token); setToken(d.token); setUser(d);
+      } else setErr(d.message||d.detail||"Failed to change password");
+    } catch { setErr("Cannot connect to server"); }
     setLoading(false);
   }
 
@@ -1031,35 +1062,71 @@ function LoginPage({ setToken, setUser }) {
           </div>
         )}
 
-        <Field label="Username">
-          <input className="ro-input" style={inp} value={u} onChange={e=>setU(e.target.value)} placeholder="Enter username" autoComplete="username" />
-        </Field>
-        <Field label="Password">
-          <input className="ro-input" style={inp} type="password" value={p} onChange={e=>setP(e.target.value)} placeholder="••••••••" autoComplete="current-password" onKeyDown={e=>e.key==="Enter"&&submit()} />
-        </Field>
-
-        <button
-          className="ro-btn"
-          onClick={submit}
-          disabled={loading}
-          style={{
-            width:"100%", padding:"12px",
-            background:loading?"#C4B5FD":G.purple,
-            backgroundSize:"200% 200%",
-            color:"#fff", border:"none", borderRadius:12,
-            fontSize:15, fontWeight:800, cursor:loading?"wait":"pointer",
-            marginTop:8, letterSpacing:"-0.01em",
-            boxShadow:loading?"none":"0 4px 20px rgba(124,58,237,0.4)",
-            transition:"all 0.2s", opacity:loading?0.8:1,
-            position:"relative", overflow:"hidden"
-          }}>
-          {loading ? (
-            <span style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:8 }}>
-              <span style={{ width:14, height:14, border:"2px solid rgba(255,255,255,0.4)", borderTopColor:"#fff", borderRadius:"50%", animation:"spin 0.7s linear infinite", display:"inline-block" }}/>
-              Signing in…
-            </span>
-          ) : "Sign In →"}
-        </button>
+        {mustChange ? (
+          <>
+            <div style={{ background:"#FFF7ED", border:"1px solid #FED7AA", borderRadius:12, padding:"12px 14px", fontSize:13, color:"#9A3412", marginBottom:16, lineHeight:1.5 }}>
+              <strong>🔒 First Login — Password Change Required</strong><br/>
+              Your account uses a temporary password. Please set a new password to continue. Minimum 8 characters with letters and numbers/symbols.
+            </div>
+            <Field label="New Password">
+              <input className="ro-input" style={inp} type="password" value={newPwd} onChange={e=>setNewPwd(e.target.value)} placeholder="Enter new password" autoComplete="new-password" />
+            </Field>
+            <Field label="Confirm New Password">
+              <input className="ro-input" style={inp} type="password" value={confirmPwd} onChange={e=>setConfirmPwd(e.target.value)} placeholder="Re-enter new password" autoComplete="new-password" onKeyDown={e=>e.key==="Enter"&&doForceChange()} />
+            </Field>
+            <button
+              className="ro-btn"
+              onClick={doForceChange}
+              disabled={loading}
+              style={{
+                width:"100%", padding:"12px",
+                background:loading?"#C4B5FD":G.purple,
+                color:"#fff", border:"none", borderRadius:12,
+                fontSize:15, fontWeight:800, cursor:loading?"wait":"pointer",
+                marginTop:8, letterSpacing:"-0.01em",
+                boxShadow:loading?"none":"0 4px 20px rgba(124,58,237,0.4)",
+                transition:"all 0.2s", opacity:loading?0.8:1,
+              }}>
+              {loading ? (
+                <span style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:8 }}>
+                  <span style={{ width:14, height:14, border:"2px solid rgba(255,255,255,0.4)", borderTopColor:"#fff", borderRadius:"50%", animation:"spin 0.7s linear infinite", display:"inline-block" }}/>
+                  Updating…
+                </span>
+              ) : "Set New Password →"}
+            </button>
+          </>
+        ) : (
+          <>
+            <Field label="Username">
+              <input className="ro-input" style={inp} value={u} onChange={e=>setU(e.target.value)} placeholder="Enter username" autoComplete="username" />
+            </Field>
+            <Field label="Password">
+              <input className="ro-input" style={inp} type="password" value={p} onChange={e=>setP(e.target.value)} placeholder="••••••••" autoComplete="current-password" onKeyDown={e=>e.key==="Enter"&&submit()} />
+            </Field>
+            <button
+              className="ro-btn"
+              onClick={submit}
+              disabled={loading}
+              style={{
+                width:"100%", padding:"12px",
+                background:loading?"#C4B5FD":G.purple,
+                backgroundSize:"200% 200%",
+                color:"#fff", border:"none", borderRadius:12,
+                fontSize:15, fontWeight:800, cursor:loading?"wait":"pointer",
+                marginTop:8, letterSpacing:"-0.01em",
+                boxShadow:loading?"none":"0 4px 20px rgba(124,58,237,0.4)",
+                transition:"all 0.2s", opacity:loading?0.8:1,
+                position:"relative", overflow:"hidden"
+              }}>
+              {loading ? (
+                <span style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:8 }}>
+                  <span style={{ width:14, height:14, border:"2px solid rgba(255,255,255,0.4)", borderTopColor:"#fff", borderRadius:"50%", animation:"spin 0.7s linear infinite", display:"inline-block" }}/>
+                  Signing in…
+                </span>
+              ) : "Sign In →"}
+            </button>
+          </>
+        )}
       </div>
     </div>
   );
@@ -1130,10 +1197,10 @@ function Dashboard({ auth, setPage, user }) {
         <StatCard icon="👥" label="Active Staff"      value={stats.totalStaff}      sub={`${stats.staffOnDuty||0} on duty · ${stats.staffAvailable||0} free`} gradient={G.purple} onClick={()=>setPage("staff")} delay={0} />
         <StatCard icon="🏥" label="Active Patients"   value={stats.totalPatients}   sub={`${stats.pendingConsents||0} need consent`} gradient={G.teal} onClick={()=>setPage("patients")} delay={50} />
         <StatCard icon="📅" label="Active Bookings"   value={stats.activeBookings}  sub={`${stats.pendingBookings||0} pending`} gradient={G.indigo} onClick={()=>setPage("bookings")} delay={100} />
-        <StatCard icon="💰" label="Revenue"           value={`₹${((stats.totalRevenue||0)/1000).toFixed(0)}k`} sub={`${collRate}% collection rate`} gradient={G.green} onClick={()=>setPage("billing")} delay={150} />
+        <StatCard icon="💰" label="Revenue"           value={formatInrShort(stats.totalRevenue||0)} sub={`${collRate}% collection rate`} gradient={G.green} onClick={()=>setPage("billing")} delay={150} />
         <StatCard icon="📋" label="Open Leads"        value={stats.totalLeads}      sub={`${stats.newLeads||0} new today`} gradient={G.amber} onClick={()=>setPage("leads")} delay={200} />
         <StatCard icon="↩️" label="Pending Refunds"   value={stats.pendingRefunds}  gradient={G.red} onClick={()=>setPage("refunds")} delay={250} />
-        <StatCard icon="💼" label="Wallet Balance"    value={`₹${((stats.totalWalletBalance||0)/1000).toFixed(1)}k`} sub={`${stats.patientsWithWallet||0} patients · ${stats.pendingWalletRefunds||0} refund requests`} gradient={G.teal} onClick={()=>setPage("wallet")} delay={275} />
+        <StatCard icon="💼" label="Wallet Balance"    value={formatInrShort(stats.totalWalletBalance||0)} sub={`${stats.patientsWithWallet||0} patients · ${stats.pendingWalletRefunds||0} refund requests`} gradient={G.teal} onClick={()=>setPage("wallet")} delay={275} />
         <StatCard icon="🚑" label="Ambulance"         value={stats.ambulanceCalls}  gradient={G.orange} onClick={()=>setPage("ambulance")} delay={300} />
         <StatCard icon="🕐" label="Today Attendance"  value={stats.todayAttendance} sub={`Low compliance: ${stats.lowCompliance||0}`} gradient={G.blue} onClick={()=>setPage("attendance")} delay={350} />
       </div>
@@ -1148,7 +1215,7 @@ function Dashboard({ auth, setPage, user }) {
               <div style={{ fontSize:12, color:C.mutedLight, marginTop:2 }}>Billed vs Collected</div>
             </div>
             <div style={{ textAlign:"right" }}>
-              <div style={{ fontSize:22, fontWeight:900, color:C.text }}>₹{(totalRevenue/1000).toFixed(1)}k</div>
+              <div style={{ fontSize:22, fontWeight:900, color:C.text }}>{formatInrShort(totalRevenue)}</div>
               <Badge color={collRate>=80?"green":"amber"}>{collRate}% collected</Badge>
             </div>
           </div>
@@ -1445,6 +1512,7 @@ function StaffModule({ auth, user }) {
       <Modal open={showForm} title={selected?"Edit Staff":"Add New Staff"} onClose={()=>setShowForm(false)} wide>
         <Grid cols={3}>
           <Input label="Full Name" required value={form.name||""} onChange={e=>setForm(f=>({...f,name:e.target.value}))} />
+          <Input label="Email" required type="email" value={form.email||""} onChange={e=>setForm(f=>({...f,email:e.target.value}))} placeholder="user@reachout.in" />
           <Select label="Role" required value={form.role||""} onChange={e=>setForm(f=>({...f,role:e.target.value}))} options={roles} />
           <Select label="Category" value={form.category||""} onChange={e=>setForm(f=>({...f,category:e.target.value}))} options={["Nursing","GDA","Allied Health","Office","Driver","Other"]} />
           <Select label="Vendor" value={form.vendor||""} onChange={e=>setForm(f=>({...f,vendor:e.target.value}))} options={vendors.map(v=>v.name)} />
